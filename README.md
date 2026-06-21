@@ -10,7 +10,7 @@ positions, or touch any money, real or paper. It pulls market data, scores
 it against a transparent rule set, and shows you the *reasoning* behind every
 call.
 
-<img width="956" height="453" alt="0" src="https://github.com/user-attachments/assets/f72efd0b-4d91-44c0-8d41-b42ad3094c6e" />
+<img width="956" height="453" alt="0" src="https://github.com/user-attachments/assets/82886323-b8d3-4b0b-81ff-ec284b213c79" />
 
 
 ---
@@ -173,6 +173,8 @@ downloads data for ~500 tickers instead of ~130.)
 ├── analyzer.py     # Flask backend: data fetch, indicators, scoring, API routes
 ├── dashboard.html  # Self-contained frontend — dark-themed, no build step
 ├── requirements.txt
+├── assets/
+│   └── dashboard-screenshot.png
 └── README.md
 ```
 
@@ -204,5 +206,18 @@ fundamental factors describe current conditions — they do not reliably
 predict future prices. Always do your own research before making investment
 decisions.
 
-## It is currently a work in progress to make it as accurate as possible to predict the market
 ---
+
+## Roadmap / ideas for next iteration
+
+- [ ] Persist historical signals to compare verdict accuracy over time
+- [ ] Backtest the scoring rules against historical price action
+- [ ] Add a watchlist / portfolio view with personal holdings highlighted
+- [ ] Dockerfile for one-command deployment
+- [ ] Swap polling for WebSockets for true real-time updates
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
