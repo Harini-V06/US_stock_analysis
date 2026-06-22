@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: stock-analyzer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # 1 worker so the in-memory data + single background poller stay consistent
+    startCommand: gunicorn analyzer:app --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: FMP_API_KEY
+        sync: false        # set this secret in the Render dashboard, not in code
+      - key: FINNHUB_API_KEY
+        sync: false        # free Finnhub key for analyst consensus
+      - key: EDGAR_UA
+        sync: false        # optional: your email, e.g. "you@example.com"
