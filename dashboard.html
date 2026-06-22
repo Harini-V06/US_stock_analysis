@@ -50,6 +50,39 @@
   .pxbox{text-align:right;white-space:nowrap}
   .px{font-weight:700;font-variant-numeric:tabular-nums}
   .chg{font-size:.8rem;font-weight:600}
+  .conf-badge{display:inline-block;font-size:.62rem;font-weight:700;letter-spacing:.4px;
+    border-radius:5px;padding:2px 7px;margin-top:5px;text-transform:uppercase}
+  .cf-sec{background:rgba(34,197,94,.15);color:#4ade80;border:1px solid rgba(34,197,94,.4)}
+  .cf-fmp{background:rgba(154,163,178,.12);color:#b7c0cf;border:1px solid #4a5468}
+  .cf-na{background:rgba(154,163,178,.10);color:#8893a5;border:1px solid #3a4456}
+  .flag{margin:0 16px 12px;font-size:.74rem;color:#fbbf24;background:rgba(251,191,36,.08);
+    border:1px solid rgba(251,191,36,.3);border-radius:6px;padding:7px 10px}
+  .srcs{display:flex;flex-wrap:wrap;gap:6px;padding:12px 16px;border-top:1px solid var(--line)}
+  .srcs .lbl{font-size:.7rem;color:var(--dim);align-self:center;margin-right:2px}
+  .srcs a{font-size:.72rem;color:var(--muted);text-decoration:none;border:1px solid var(--line);
+    border-radius:999px;padding:3px 9px}
+  .srcs a:hover{color:var(--txt);border-color:var(--accent)}
+  /* macro banner */
+  .macro{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:13px 16px;margin-bottom:18px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+  .macro .reg{font-weight:700;font-size:.9rem;padding:3px 10px;border-radius:6px}
+  .reg-on{background:rgba(34,197,94,.16);color:#4ade80;border:1px solid rgba(34,197,94,.4)}
+  .reg-off{background:rgba(239,68,68,.16);color:#f87171;border:1px solid rgba(239,68,68,.4)}
+  .reg-neu{background:rgba(154,163,178,.14);color:#b7c0cf;border:1px solid #4a5468}
+  .macro .note{color:var(--muted);font-size:.82rem;flex:1;min-width:160px}
+  .macro .read{display:flex;gap:6px;flex-wrap:wrap}
+  .macro .read a{font-size:.72rem;color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:3px 9px}
+  .macro .read a:hover{color:var(--txt);border-color:var(--accent)}
+  /* card strips */
+  .strip{display:flex;align-items:center;gap:8px;padding:9px 16px;border-bottom:1px solid var(--line);font-size:.8rem;flex-wrap:wrap}
+  .strip .k{color:var(--dim);font-size:.7rem;text-transform:uppercase;letter-spacing:.4px;min-width:54px}
+  .vpill{font-weight:700;font-size:.74rem;padding:3px 9px;border-radius:6px}
+  .tally{color:var(--muted);font-size:.78rem}
+  .tally b{color:#cbd5e1}
+  .agree{margin-left:auto;font-size:.72rem;font-weight:700;padding:2px 8px;border-radius:5px}
+  .ag-ok{background:rgba(34,197,94,.14);color:#4ade80}
+  .ag-mix{background:rgba(251,191,36,.12);color:#fbbf24}
+  .ag-na{background:rgba(154,163,178,.12);color:#8893a5}
 
   .cols{display:grid;grid-template-columns:1fr 1fr}
   .col{padding:14px 16px}
@@ -148,7 +181,7 @@
 const vClass = v => "v-"+v.toLowerCase().replace(/ /g,"-");
 const isBuy  = v => v==="BUY"||v==="STRONG BUY";
 const isSell = v => v==="SELL"||v==="STRONG SELL";
-let DATA = {}, FILTER="all";
+let DATA = {}, FILTER="all", MACRO=null;
 
 const els = {
   q: document.getElementById("q"), sector: document.getElementById("sector"),
@@ -168,7 +201,14 @@ async function load(){
       '<span style="opacity:.7">('+e.message+')</span></div>';
     return;
   }
+  if(d.status==="no_api_key"){
+    els.content.innerHTML='<div class="err"><b>No data API key set.</b><br>'+
+      'Add an environment variable named <b>FMP_API_KEY</b> with your Financial Modeling Prep key, then redeploy/restart.</div>';
+    els.meta.textContent="Waiting for API key";
+    return;
+  }
   DATA = d.signals || {};
+  MACRO = d.macro || null;
   // sector dropdown
   if(d.sectors && els.sector.options.length<=1){
     d.sectors.forEach(s=>{const o=document.createElement("option");o.value=o.textContent=s;els.sector.appendChild(o);});
@@ -206,8 +246,22 @@ function draw(){
     return Math.max(b.st.conviction,b.lt.conviction)-Math.max(a.st.conviction,a.lt.conviction);
   });
 
-  if(!rows.length){ els.content.innerHTML='<div class="empty">No stocks match this filter yet.</div>'; return; }
-  els.content.innerHTML = '<div class="grid">'+rows.map(card).join("")+'</div>';
+  if(!rows.length){ els.content.innerHTML=macroBanner()+'<div class="empty">No stocks match this filter yet.</div>'; return; }
+  els.content.innerHTML = macroBanner()+'<div class="grid">'+rows.map(card).join("")+'</div>';
+}
+
+function macroBanner(){
+  if(!MACRO) return "";
+  const r = MACRO.regime||"Neutral";
+  const cls = r==="Risk-on"?"reg-on":(r==="Risk-off"?"reg-off":"reg-neu");
+  return `<div class="macro">
+    <span class="reg ${cls}">Market: ${r}</span>
+    <span class="note">${MACRO.note||""}</span>
+    <span class="read"><span style="color:#5f6f88;font-size:.7rem;align-self:center">Read commentary ↗</span>
+      <a target="_blank" rel="noopener" href="https://www.goldmansachs.com/insights">Goldman</a>
+      <a target="_blank" rel="noopener" href="https://www.jpmorgan.com/insights/research">J.P. Morgan</a>
+      <a target="_blank" rel="noopener" href="https://www.blackrock.com/us/individual/insights/blackrock-investment-institute/weekly-commentary">BlackRock</a>
+    </span></div>`;
 }
 
 function horizon(s, kind){
@@ -237,14 +291,50 @@ function horizon(s, kind){
 
 function card(s){
   const chgCol = s.day_change>=0 ? "#22c55e" : "#ef4444";
+  const conf = s.data_confidence || "FMP data";
+  const cfClass = conf.indexOf("SEC")>=0 ? "cf-sec" : (conf.indexOf("ETF")>=0 ? "cf-na" : "cf-fmp");
+  const cfText  = conf.indexOf("SEC")>=0 ? "✓ SEC-verified" : (conf.indexOf("ETF")>=0 ? "ETF · trend only" : "FMP data");
+  const flag = s.flag ? `<div class="flag">⚠ ${s.flag}</div>` : "";
+  const t = encodeURIComponent(s.sym);
+  const links = `<div class="srcs"><span class="lbl">Cross-check ↗</span>`+
+    `<a target="_blank" rel="noopener" href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&ticker=${t}&type=10-K">SEC filings</a>`+
+    `<a target="_blank" rel="noopener" href="https://stockanalysis.com/stocks/${t}/">StockAnalysis</a>`+
+    `<a target="_blank" rel="noopener" href="https://finance.yahoo.com/quote/${t}">Yahoo</a>`+
+    `<a target="_blank" rel="noopener" href="https://finviz.com/quote.ashx?t=${t}">Finviz</a>`+
+    `<a target="_blank" rel="noopener" href="https://www.tradingview.com/symbols/${t}/">TradingView</a></div>`;
+  const cb = s.combined || null;
+  const cons = s.consensus || null;
+  let overall = "";
+  if(cb){
+    const agCls = cb.label==="Aligned"?"ag-ok":(cb.label==="Mixed signals"?"ag-mix":"ag-na");
+    overall = `<div class="strip">
+      <span class="k">Overall</span>
+      <span class="vpill ${vClass(cb.verdict)}">${cb.verdict}</span>
+      <span class="tally"><b>${cb.confidence}%</b> confidence</span>
+      <span class="agree ${agCls}">${cb.label}</span></div>`;
+  }
+  let wall = "";
+  if(cons){
+    wall = `<div class="strip">
+      <span class="k">Wall St</span>
+      <span class="vpill ${vClass(cons.verdict)}">${cons.verdict}</span>
+      <span class="tally"><b>${cons.buy}</b> buy · <b>${cons.hold}</b> hold · <b>${cons.sell}</b> sell <span style="color:#5f6f88">(${cons.total} analysts)</span></span></div>`;
+  } else if(!s.sector || s.sector.indexOf("ETF")<0){
+    wall = `<div class="strip"><span class="k">Wall St</span><span class="tally" style="color:#5f6f88">no analyst data</span></div>`;
+  }
   return `<div class="card">
     <div class="chead">
       <div><div class="name">${s.name||s.sym}</div>
-        <span class="tick">${s.sym}</span><div class="sect">${s.sector||""}</div></div>
+        <span class="tick">${s.sym}</span><div class="sect">${s.sector||""}</div>
+        <span class="conf-badge ${cfClass}">${cfText}</span></div>
       <div class="pxbox"><div class="px">$${s.price}</div>
         <div class="chg" style="color:${chgCol}">${s.day_change>=0?"+":""}${s.day_change}%</div></div>
     </div>
+    ${flag}
+    ${overall}
+    ${wall}
     <div class="cols">${horizon(s.st,"st")}${horizon(s.lt,"lt")}</div>
+    ${links}
   </div>`;
 }
 
