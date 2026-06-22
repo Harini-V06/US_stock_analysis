@@ -1,186 +1,222 @@
 """
-US Stock Analyzer  —  dual-horizon (short-term 1-3 weeks  +  long-term 5 years)
+US Stock Analyzer  —  hosted edition (Financial Modeling Prep data)
 
-This is an ANALYSIS TOOL only. It does NOT place trades, hold positions, or use
-any mock/paper money. It scores each stock on Fundamentals + Technicals + Quant
-and gives a verdict (STRONG BUY / BUY / HOLD / SELL / STRONG SELL) plus a
-*conviction* score for each horizon.
+Dual-horizon analysis only (no trading, no mock data):
+  • Short-term  (1–3 weeks)  : technical + quant
+  • Long-term   (5 years)    : fundamentals + valuation + trend
 
-IMPORTANT, read this:
-  - "Conviction" measures how strongly the factors agree — it is NOT the
-    probability the call is correct. It is deliberately capped at 80%.
-  - Technical/fundamental factors describe conditions; they do not reliably
-    predict prices. Treat output as a screen, not advice. Not financial advice.
+Designed to run on a free host (e.g. Render) behind gunicorn, with data from
+Financial Modeling Prep (FMP). Reads the API key from the FMP_API_KEY
+environment variable — the key is NEVER hard-coded.
 
-Run:  pip install flask flask-cors yfinance numpy pandas
-      python analyzer.py
-Open: http://localhost:5001/
+Honest notes (shown in the UI too):
+  • "Conviction" = how strongly the factors agree (capped 80%), NOT the
+    probability the call is right.
+  • Free FMP plan = 250 requests/day, so the universe is ~50 stocks and data
+    refreshes about once a day. Both are easy to raise on a paid tier.
+  • Indicators are computed in pure Python — no numpy/pandas — so the host
+    build is tiny and fast.
+
+Local run:  pip install flask flask-cors requests
+            set FMP_API_KEY=your_key   (PowerShell: $env:FMP_API_KEY="your_key")
+            python analyzer.py
 """
 
+import os
 import time
+import math
 import threading
 from datetime import datetime, timedelta
 
-import numpy as np
-import pandas as pd
-import yfinance as yf
+import requests
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
-import os
 
 app = Flask(__name__)
 CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  UNIVERSE  — ~130 liquid US names across every sector (incl. your holdings).
-#  To analyze MORE: just add tickers to this list.
-#  To load the full S&P 500 instead, set USE_SP500 = True (slower first run).
-# ──────────────────────────────────────────────────────────────────────────────
-USE_SP500 = False
+FMP_KEY  = os.environ.get("FMP_API_KEY", "").strip()
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-UNIVERSE = [
-    # Mega/large-cap tech & semis
-    "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","AVGO","TSLA","AMD","ORCL",
-    "ADBE","CRM","CSCO","ACN","INTC","QCOM","TXN","AMAT","MU","ARM","PLTR","NOW",
-    "INTU","IBM","ADI","LRCX","KLAC","SNPS","CDNS","PANW","CRWD","SNOW","NET",
-    "DDOG","MRVL",
-    # Communication / consumer
-    "NFLX","DIS","CMCSA","T","VZ","TMUS","NKE","SBUX","MCD","HD","LOW","TGT",
-    "COST","WMT","PG","KO","PEP","PM","MO","MDLZ","CL",
-    # Financials
-    "JPM","BAC","WFC","GS","MS","C","SCHW","BLK","AXP","V","MA","PYPL","SOFI","COIN",
-    # Healthcare
-    "UNH","JNJ","LLY","PFE","MRK","ABBV","TMO","ABT","DHR","BMY","AMGN","GILD",
-    "CVS","MDT","ISRG",
-    # Industrials / energy
-    "CAT","DE","BA","GE","HON","UPS","RTX","LMT","XOM","CVX","COP","SLB","ENB",
-    # Autos / EV / space
-    "F","GM","RIVN","LCID","LUNR","RKLB",
-    # High-growth / internet
-    "UBER","ABNB","SHOP","SQ","ROKU","PINS","SNAP","RBLX","DKNG","U",
-    # Broad ETFs (fundamentals limited — scored on trend/quant)
-    "SPY","QQQ","VOO","VTI","SCHG","SCHD","VXUS","IWM","DIA",
+# ── Config ────────────────────────────────────────────────────────────────────
+POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", 86400))  # re-analyze once/day
+RATIOS_TTL_H    = 24      # fundamentals cache (hours)
+GROWTH_TTL_H    = 24 * 7  # growth cache (weekly)
+TARGET_TTL_H    = 24 * 7  # analyst target cache (weekly)
+PRICE_BARS      = 400     # daily bars to pull (enough for MA200 + 1y momentum)
+CALL_SLEEP      = 0.25    # gentle pause between API calls
+
+# ── Universe (~50 liquid names; name+sector embedded so we spend 0 calls on it)─
+# Add rows to analyze more (watch the 250/day free budget: ~2 calls per stock).
+U = [
+    ("AAPL","Apple","Technology"),("MSFT","Microsoft","Technology"),
+    ("NVDA","NVIDIA","Technology"),("GOOGL","Alphabet","Communication Services"),
+    ("AMZN","Amazon","Consumer Cyclical"),("META","Meta Platforms","Communication Services"),
+    ("AVGO","Broadcom","Technology"),("AMD","Advanced Micro Devices","Technology"),
+    ("ORCL","Oracle","Technology"),("CRM","Salesforce","Technology"),
+    ("ADBE","Adobe","Technology"),("ARM","Arm Holdings","Technology"),
+    ("PLTR","Palantir","Technology"),("QCOM","Qualcomm","Technology"),
+    ("MU","Micron","Technology"),("INTC","Intel","Technology"),
+    ("NOW","ServiceNow","Technology"),("SNOW","Snowflake","Technology"),
+    ("NET","Cloudflare","Technology"),("CRWD","CrowdStrike","Technology"),
+    ("PANW","Palo Alto Networks","Technology"),
+    ("NFLX","Netflix","Communication Services"),("DIS","Disney","Communication Services"),
+    ("NKE","Nike","Consumer Cyclical"),("SBUX","Starbucks","Consumer Cyclical"),
+    ("MCD","McDonald's","Consumer Cyclical"),("COST","Costco","Consumer Defensive"),
+    ("WMT","Walmart","Consumer Defensive"),("KO","Coca-Cola","Consumer Defensive"),
+    ("PEP","PepsiCo","Consumer Defensive"),
+    ("JPM","JPMorgan Chase","Financial Services"),("BAC","Bank of America","Financial Services"),
+    ("V","Visa","Financial Services"),("MA","Mastercard","Financial Services"),
+    ("GS","Goldman Sachs","Financial Services"),("SOFI","SoFi Technologies","Financial Services"),
+    ("COIN","Coinbase","Financial Services"),("PYPL","PayPal","Financial Services"),
+    ("UNH","UnitedHealth","Healthcare"),("JNJ","Johnson & Johnson","Healthcare"),
+    ("LLY","Eli Lilly","Healthcare"),("PFE","Pfizer","Healthcare"),
+    ("ABBV","AbbVie","Healthcare"),("MRK","Merck","Healthcare"),
+    ("CAT","Caterpillar","Industrials"),("BA","Boeing","Industrials"),
+    ("GE","GE Aerospace","Industrials"),("XOM","Exxon Mobil","Energy"),
+    ("CVX","Chevron","Energy"),
+    ("TSLA","Tesla","Consumer Cyclical"),("F","Ford","Consumer Cyclical"),
+    ("LUNR","Intuitive Machines","Industrials"),("RKLB","Rocket Lab","Industrials"),
+    # ETFs (scored on trend only)
+    ("SPY","S&P 500 ETF","ETF / Fund"),("QQQ","Nasdaq-100 ETF","ETF / Fund"),
+    ("SCHG","Schwab US Large-Cap Growth ETF","ETF / Fund"),("VOO","Vanguard S&P 500 ETF","ETF / Fund"),
 ]
+UNIVERSE = [{"sym": s, "name": n, "sector": sec, "etf": sec == "ETF / Fund"} for s, n, sec in U]
+ETF_SET  = {u["sym"] for u in UNIVERSE if u["etf"]}
+BENCH    = "SPY"
 
-BENCH = "SPY"
-
-POLL_INTERVAL = 1800      # re-analyze prices every 30 min (avoids rate limits)
-FUND_TTL_HOURS = 12       # fundamentals change slowly — cache for 12h
-HISTORY_PERIOD = "5y"     # 5y daily covers both the 5y LT view and the ST slice
-
-# ── Revised verdict scale (documented) ────────────────────────────────────────
-# Net score is in [-1, +1]. Thresholds tightened so STRONG isn't over-called.
+# ── verdict scale + honest conviction (capped 80, floored 50) ─────────────────
 def verdict(score):
     if   score >=  0.45: return "STRONG BUY"
     elif score >=  0.18: return "BUY"
     elif score <= -0.45: return "STRONG SELL"
     elif score <= -0.18: return "SELL"
-    else:                return "HOLD"
+    return "HOLD"
 
-# ── Honest conviction (NOT probability), capped at 80, floored at 50 ───────────
 def conviction(score, factors):
     mag = abs(score)
     aligned = sum(abs(f["contrib"]) for f in factors if (f["contrib"] >= 0) == (score >= 0))
     total   = sum(abs(f["contrib"]) for f in factors) or 1e-9
-    agreement = aligned / total                      # 0.5 .. 1.0 typically
-    raw = (50 + 30 * mag) * (0.7 + 0.3 * agreement)  # never exceeds 80
+    agreement = aligned / total
+    raw = (50 + 30 * mag) * (0.7 + 0.3 * agreement)
     return int(max(50, min(80, round(raw))))
 
 def conviction_tier(c):
-    if c >= 72: return "High"
-    if c >= 60: return "Moderate"
-    return "Low"
+    return "High" if c >= 72 else ("Moderate" if c >= 60 else "Low")
 
 state = {
-    "signals": {},
-    "sectors": [],
-    "last_updated": None,
-    "status": "starting",
-    "progress": {"done": 0, "total": len(UNIVERSE)},
-    "universe_size": len(UNIVERSE),
+    "signals": {}, "sectors": [], "last_updated": None,
+    "status": "starting", "progress": {"done": 0, "total": len(UNIVERSE)},
+    "universe_size": len(UNIVERSE), "macro": None,
 }
 lock = threading.Lock()
-_fund_cache = {}   # symbol -> (info_dict, fetched_at)
+_cache = {}   # key -> (value, fetched_at)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INDICATORS
+#  PURE-PYTHON INDICATORS  (lists are oldest→newest)
 # ══════════════════════════════════════════════════════════════════════════════
-def rsi(closes, period=14):
-    if len(closes) < period + 2: return 50.0
-    d = np.diff(closes.astype(float))
-    g = np.where(d > 0, d, 0.0); l = np.where(d < 0, -d, 0.0)
-    ag = g[:period].mean(); al = l[:period].mean() or 1e-9
-    for i in range(period, len(d)):
-        ag = (ag*(period-1)+g[i]) / period
-        al = (al*(period-1)+l[i]) / period
+def sma(v, p):       return sum(v[-p:]) / p if len(v) >= p else None
+def clamp(x, lo=-1.0, hi=1.0): return max(lo, min(hi, x))
+
+def ema_series(v, span):
+    k = 2 / (span + 1); out = []; e = v[0]
+    for i, x in enumerate(v):
+        e = x if i == 0 else x * k + e * (1 - k)
+        out.append(e)
+    return out
+
+def rsi(v, period=14):
+    if len(v) < period + 2: return 50.0
+    d = [v[i+1] - v[i] for i in range(len(v) - 1)]
+    ag = sum(x for x in d[:period] if x > 0) / period
+    al = (sum(-x for x in d[:period] if x < 0) / period) or 1e-9
+    for x in d[period:]:
+        g = x if x > 0 else 0.0; l = -x if x < 0 else 0.0
+        ag = (ag * (period - 1) + g) / period
+        al = (al * (period - 1) + l) / period
     rs = ag / (al or 1e-9)
-    return round(100 - 100/(1+rs), 2)
+    return round(100 - 100 / (1 + rs), 2)
 
-def macd(closes):
-    s = pd.Series(closes.astype(float))
-    e12 = s.ewm(span=12, adjust=False).mean(); e26 = s.ewm(span=26, adjust=False).mean()
-    m = e12 - e26; sig = m.ewm(span=9, adjust=False).mean()
-    up = m.iloc[-1] > sig.iloc[-1] and m.iloc[-3] <= sig.iloc[-3]
-    dn = m.iloc[-1] < sig.iloc[-1] and m.iloc[-3] >= sig.iloc[-3]
-    return round(m.iloc[-1],3), round(sig.iloc[-1],3), bool(up), bool(dn)
+def macd(v):
+    if len(v) < 35: return 0.0, 0.0, False, False
+    e12 = ema_series(v, 12); e26 = ema_series(v, 26)
+    line = [a - b for a, b in zip(e12, e26)]
+    sig  = ema_series(line, 9)
+    up = line[-1] > sig[-1] and line[-3] <= sig[-3]
+    dn = line[-1] < sig[-1] and line[-3] >= sig[-3]
+    return round(line[-1], 3), round(sig[-1], 3), up, dn
 
-def bollinger_pctb(closes, period=20):
-    if len(closes) < period: return 0.5
-    s = pd.Series(closes.astype(float)).tail(period)
-    sma = s.mean(); std = s.std()
-    if std == 0: return 0.5
-    return float((closes[-1] - (sma - 2*std)) / (4*std))
+def stdev(v):
+    n = len(v); m = sum(v) / n
+    return (sum((x - m) ** 2 for x in v) / n) ** 0.5
 
-def ma(closes, p):
-    return float(pd.Series(closes.astype(float)).tail(p).mean()) if len(closes) >= p else None
+def bollinger_pctb(v, period=20):
+    if len(v) < period: return 0.5
+    seg = v[-period:]; m = sum(seg) / period; sd = stdev(seg)
+    return 0.5 if sd == 0 else (v[-1] - (m - 2 * sd)) / (4 * sd)
 
-def momentum(closes, days):
-    if len(closes) < days+1: return 0.0
-    return round((closes[-1]-closes[-days-1]) / closes[-days-1] * 100, 2)
+def momentum(v, days):
+    if len(v) < days + 1: return 0.0
+    return round((v[-1] - v[-days-1]) / v[-days-1] * 100, 2)
 
-def rel_strength(closes, bench, days):
-    if len(closes) < days+1 or len(bench) < days+1: return 0.0
-    sr = (closes[-1]-closes[-days-1]) / closes[-days-1]
-    br = (bench[-1]-bench[-days-1]) / bench[-days-1]
-    return round((sr-br)*100, 2)
+def rel_strength(v, b, days):
+    if len(v) < days + 1 or len(b) < days + 1: return 0.0
+    return round(((v[-1]-v[-days-1])/v[-days-1] - (b[-1]-b[-days-1])/b[-days-1]) * 100, 2)
 
 def atr_pct(highs, lows, closes, period=14):
-    if len(closes) < period+1: return None
+    if len(closes) < period + 1: return None
     trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
            for i in range(1, len(closes))]
-    return round(float(np.mean(trs[-period:]) / closes[-1] * 100), 2)
+    return round(sum(trs[-period:]) / period / closes[-1] * 100, 2)
 
 def ann_vol(closes, days=63):
-    if len(closes) < days+1: return None
-    rets = np.diff(closes[-days-1:]) / closes[-days-1:-1]
-    return round(float(np.std(rets) * np.sqrt(252) * 100), 1)
+    if len(closes) < days + 1: return None
+    seg = closes[-days-1:]
+    rets = [(seg[i+1]-seg[i])/seg[i] for i in range(len(seg)-1)]
+    return round(stdev(rets) * math.sqrt(252) * 100, 1)
 
 def max_drawdown(closes, days=252):
     seg = closes[-days:] if len(closes) >= days else closes
-    peak = np.maximum.accumulate(seg)
-    return round(float(((seg - peak) / peak).min() * 100), 1)
+    peak = seg[0]; mdd = 0.0
+    for x in seg:
+        peak = max(peak, x); mdd = min(mdd, (x - peak) / peak)
+    return round(mdd * 100, 1)
 
 def pos_52w(closes):
     seg = closes[-252:] if len(closes) >= 252 else closes
-    lo, hi = float(seg.min()), float(seg.max())
-    if hi == lo: return 50
-    return int((closes[-1]-lo)/(hi-lo)*100)
+    lo, hi = min(seg), max(seg)
+    return 50 if hi == lo else int((closes[-1]-lo)/(hi-lo)*100)
 
-def clamp(x, lo=-1.0, hi=1.0): return max(lo, min(hi, x))
+def _r(x):
+    try: return round(float(x), 2)
+    except (TypeError, ValueError): return None
+def _pct(x):
+    try: return round(float(x) * 100, 1)
+    except (TypeError, ValueError): return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SHORT-TERM SIGNAL (1–3 weeks)  — technical + quant heavy
-#  Each factor returns a sub-score in [-1, +1]; weights sum to 1.0.
+#  SIGNALS
 # ══════════════════════════════════════════════════════════════════════════════
-ST_WEIGHTS = {"trend":0.25, "momentum":0.30, "meanrev":0.10,
-              "volume":0.10, "relstr":0.15, "quant":0.10}
+ST_W = {"trend":0.25, "momentum":0.30, "meanrev":0.10, "volume":0.10, "relstr":0.15, "quant":0.10}
+LT_W = {"growth":0.20, "profit":0.15, "health":0.15, "valuation":0.20, "sentiment":0.10, "trend":0.20}
 
-def short_term_signal(closes, highs, lows, volumes, spy):
-    price = float(closes[-1]); factors = []; reasons = []
+def _f(name, sub, w):
+    return {"name": name, "score": round(sub, 2), "weight": w, "contrib": round(sub * w, 4)}
 
-    # Trend
-    ma20, ma50, ma200 = ma(closes,20), ma(closes,50), ma(closes,200)
+def _assemble(score, factors, reasons, metrics, price):
+    c = conviction(score, factors)
+    fs = sorted(factors, key=lambda f: abs(f["contrib"]), reverse=True)
+    return {"verdict": verdict(score), "score": score, "conviction": c,
+            "tier": conviction_tier(c), "price": round(price, 2), "reasons": reasons[:8],
+            "factors": [{"name": f["name"], "score": f["score"], "weight": int(f["weight"]*100)} for f in fs],
+            "metrics": metrics}
+
+def short_term_signal(closes, highs, lows, vols, spy):
+    price = closes[-1]; factors = []; reasons = []
+    ma20, ma50, ma200 = sma(closes,20), sma(closes,50), sma(closes,200)
+
     t = 0.0
     if ma50 and ma200:
         if ma50 > ma200: t += 0.6; reasons.append("Uptrend: MA50 above MA200 (golden cross)")
@@ -188,96 +224,68 @@ def short_term_signal(closes, highs, lows, volumes, spy):
     if ma20:
         if price > ma20: t += 0.4; reasons.append("Price above 20-day average")
         else:            t -= 0.4; reasons.append("Price below 20-day average")
-    factors.append(_f("Trend", clamp(t), ST_WEIGHTS["trend"]))
+    factors.append(_f("Trend", clamp(t), ST_W["trend"]))
 
-    # Momentum (RSI + MACD)
-    r = rsi(closes); mval, msig, up, dn = macd(closes)
-    m = 0.0
+    r = rsi(closes); mval, msig, up, dn = macd(closes); m = 0.0
     if   r < 30: m += 0.6; reasons.append(f"RSI {r} — oversold, bounce potential")
     elif r < 45: m += 0.2
     elif r > 70: m -= 0.6; reasons.append(f"RSI {r} — overbought")
     elif r > 55: m -= 0.2
-    if   up:            m += 0.6; reasons.append("MACD bullish crossover")
-    elif mval > msig:   m += 0.3
-    elif dn:            m -= 0.6; reasons.append("MACD bearish crossover")
-    else:              m -= 0.3
-    factors.append(_f("Momentum", clamp(m), ST_WEIGHTS["momentum"]))
+    if   up:          m += 0.6; reasons.append("MACD bullish crossover")
+    elif mval > msig: m += 0.3
+    elif dn:          m -= 0.6; reasons.append("MACD bearish crossover")
+    else:             m -= 0.3
+    factors.append(_f("Momentum", clamp(m), ST_W["momentum"]))
 
-    # Mean reversion (Bollinger %b)
     pb = bollinger_pctb(closes); mr = 0.0
     if   pb < 0.05: mr += 0.8; reasons.append("Below lower Bollinger band — stretched down")
     elif pb < 0.2:  mr += 0.4
     elif pb > 0.95: mr -= 0.8; reasons.append("Above upper Bollinger band — stretched up")
     elif pb > 0.8:  mr -= 0.4
-    factors.append(_f("Mean reversion", clamp(mr), ST_WEIGHTS["meanrev"]))
+    factors.append(_f("Mean reversion", clamp(mr), ST_W["meanrev"]))
 
-    # Volume confirmation
     v = 0.0
-    if len(volumes) >= 20:
-        vr = float(np.mean(volumes[-5:]) / (np.mean(volumes[-20:]) or 1e-9))
-        direction = 1 if m >= 0 else -1
-        if   vr > 1.8: v = direction*0.8; reasons.append(f"Volume surging ({vr:.1f}x avg) — confirms move")
-        elif vr > 1.3: v = direction*0.4
-        elif vr < 0.6: v = -direction*0.3; reasons.append("Thin volume — weak conviction")
-    factors.append(_f("Volume", clamp(v), ST_WEIGHTS["volume"]))
+    if len(vols) >= 20:
+        vr = (sum(vols[-5:])/5) / ((sum(vols[-20:])/20) or 1e-9)
+        d = 1 if m >= 0 else -1
+        if   vr > 1.8: v = d*0.8; reasons.append(f"Volume surging ({vr:.1f}x avg) — confirms move")
+        elif vr > 1.3: v = d*0.4
+        elif vr < 0.6: v = -d*0.3; reasons.append("Thin volume — weak conviction")
+    factors.append(_f("Volume", clamp(v), ST_W["volume"]))
 
-    # Relative strength vs SPY (~15 trading days)
-    rs15 = rel_strength(closes, spy, 15); q = clamp(rs15/10.0)
+    rs15 = rel_strength(closes, spy, 15)
     if   rs15 > 5:  reasons.append(f"Outperforming S&P by {rs15:.1f}% (3wk)")
     elif rs15 < -5: reasons.append(f"Lagging S&P by {abs(rs15):.1f}% (3wk)")
-    factors.append(_f("Relative strength", q, ST_WEIGHTS["relstr"]))
+    factors.append(_f("Relative strength", clamp(rs15/10.0), ST_W["relstr"]))
 
-    # Quant risk (volatility regime) — high vol dampens directional conviction
-    av = ann_vol(closes); quant = 0.0
+    av = ann_vol(closes); q = 0.0
     if av is not None:
-        if av > 60:  quant = -0.4; reasons.append(f"Very high volatility ({av}%/yr) — elevated risk")
-        elif av > 40: quant = -0.2
-        elif av < 20: quant = 0.2
-    factors.append(_f("Quant / risk", clamp(quant), ST_WEIGHTS["quant"]))
+        if   av > 60: q = -0.4; reasons.append(f"Very high volatility ({av}%/yr) — elevated risk")
+        elif av > 40: q = -0.2
+        elif av < 20: q = 0.2
+    factors.append(_f("Quant / risk", clamp(q), ST_W["quant"]))
 
     score = round(sum(f["contrib"] for f in factors), 3)
-    metrics = {
-        "RSI (14)": r, "MACD": mval, "MACD signal": msig,
-        "Bollinger %b": round(pb*100), "Momentum 5d": momentum(closes,5),
-        "Momentum 10d": momentum(closes,10), "vs S&P (15d) %": rs15,
-        "ATR %": atr_pct(highs,lows,closes), "Volatility %/yr": av,
-        "MA20": _r(ma20), "MA50": _r(ma50), "MA200": _r(ma200),
-    }
+    metrics = {"RSI (14)": r, "MACD": mval, "MACD signal": msig,
+               "Bollinger %b": round(pb*100), "Momentum 5d": momentum(closes,5),
+               "Momentum 10d": momentum(closes,10), "vs S&P (15d) %": rs15,
+               "ATR %": atr_pct(highs,lows,closes), "Volatility %/yr": av,
+               "MA20": _r(ma20), "MA50": _r(ma50), "MA200": _r(ma200)}
     return _assemble(score, factors, reasons, metrics, price)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LONG-TERM SIGNAL (5 years)  — fundamentals heavy + valuation + quant trend
-# ══════════════════════════════════════════════════════════════════════════════
-LT_WEIGHTS = {"growth":0.20, "profit":0.15, "health":0.15,
-              "valuation":0.20, "sentiment":0.10, "trend":0.20}
-
-def long_term_signal(closes, spy, info, is_etf):
-    price = float(closes[-1]); factors = []; reasons = []
-
+def long_term_signal(closes, spy, fund, is_etf):
+    price = closes[-1]; factors = []; reasons = []
     if is_etf:
-        # ETFs: no company fundamentals — score purely on long-run trend/quant
         for k in ("growth","profit","health","valuation","sentiment"):
-            factors.append(_f(k.title(), 0.0, LT_WEIGHTS[k]))
+            factors.append(_f(k.title(), 0.0, LT_W[k]))
         reasons.append("ETF / fund — company fundamentals not applicable; trend-based only")
     else:
-        rev   = info.get("revenueGrowth") or 0
-        earn  = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth") or 0
-        pm    = info.get("profitMargins") or 0
-        roe   = info.get("returnOnEquity") or 0
-        roa   = info.get("returnOnAssets") or 0
-        de    = info.get("debtToEquity") or 0
-        cr    = info.get("currentRatio") or 0
-        fcf   = info.get("freeCashflow") or 0
-        mcap  = info.get("marketCap") or 1
-        pe    = info.get("forwardPE") or info.get("trailingPE") or 0
-        peg   = info.get("pegRatio") or 0
-        ps    = info.get("priceToSalesTrailing12Months") or 0
-        tgt   = info.get("targetMeanPrice") or 0
-        rec   = (info.get("recommendationKey") or "").lower()
-        sector= info.get("sector","")
-        growth_sector = any(x in sector for x in ["Technology","Communication","Consumer Cyclical"])
+        rev=fund.get("rev",0); earn=fund.get("earn",0); pm=fund.get("pm",0)
+        roe=fund.get("roe",0); roa=fund.get("roa",0); de=fund.get("de",0)
+        cr=fund.get("cr",0); fcfy=fund.get("fcfy",0); pe=fund.get("pe",0)
+        peg=fund.get("peg",0); ps=fund.get("ps",0); tgt=fund.get("target",0)
+        growth_sector = fund.get("growth_sector", False)
 
-        # Growth
         g = 0.0
         if   rev > 0.30: g += 0.6; reasons.append(f"Revenue growth {rev*100:.0f}% — exceptional")
         elif rev > 0.15: g += 0.4; reasons.append(f"Revenue growth {rev*100:.0f}% — strong")
@@ -286,9 +294,8 @@ def long_term_signal(closes, spy, info, is_etf):
         if   earn > 0.20: g += 0.4; reasons.append(f"Earnings growth {earn*100:.0f}%")
         elif earn > 0.05: g += 0.2
         elif earn < -0.10: g -= 0.4; reasons.append("Earnings shrinking")
-        factors.append(_f("Growth", clamp(g), LT_WEIGHTS["growth"]))
+        factors.append(_f("Growth", clamp(g), LT_W["growth"]))
 
-        # Profitability
         p = 0.0
         if   pm > 0.25: p += 0.5; reasons.append(f"High net margin {pm*100:.0f}%")
         elif pm > 0.10: p += 0.2
@@ -297,21 +304,18 @@ def long_term_signal(closes, spy, info, is_etf):
         elif roe > 0.12: p += 0.2
         elif roe < 0:    p -= 0.3
         if roa > 0.10: p += 0.1
-        factors.append(_f("Profitability", clamp(p), LT_WEIGHTS["profit"]))
+        factors.append(_f("Profitability", clamp(p), LT_W["profit"]))
 
-        # Financial health
         h = 0.0
-        fcfy = fcf/mcap if mcap else 0
         if   fcfy > 0.04: h += 0.5; reasons.append(f"Strong free-cash-flow yield {fcfy*100:.1f}%")
         elif fcfy > 0.01: h += 0.2
         elif fcfy < 0:    h -= 0.4; reasons.append("Negative free cash flow")
-        if   0 < de < 50:  h += 0.3; reasons.append("Low debt load")
-        elif de > 200:     h -= 0.4; reasons.append("High debt load")
-        if   cr > 2:  h += 0.2
+        if   0 < de < 0.5: h += 0.3; reasons.append("Low debt load")
+        elif de > 2.0:     h -= 0.4; reasons.append("High debt load")
+        if   cr > 2:   h += 0.2
         elif 0 < cr < 1: h -= 0.3; reasons.append("Weak liquidity (current ratio < 1)")
-        factors.append(_f("Financial health", clamp(h), LT_WEIGHTS["health"]))
+        factors.append(_f("Financial health", clamp(h), LT_W["health"]))
 
-        # Valuation
         val = 0.0
         cheap, fair, rich = (30,50,80) if growth_sector else (18,30,55)
         if pe > 0:
@@ -320,23 +324,19 @@ def long_term_signal(closes, spy, info, is_etf):
             elif pe > rich:  val -= 0.6; reasons.append(f"Expensive P/E {pe:.0f}")
             elif pe > fair:  val -= 0.2
         if peg > 0:
-            if   peg < 1:  val += 0.4; reasons.append(f"PEG {peg:.2f} < 1 — cheap vs growth")
-            elif peg > 3:  val -= 0.4; reasons.append(f"PEG {peg:.2f} — growth fully priced in")
-        factors.append(_f("Valuation", clamp(val), LT_WEIGHTS["valuation"]))
+            if   peg < 1: val += 0.4; reasons.append(f"PEG {peg:.2f} < 1 — cheap vs growth")
+            elif peg > 3: val -= 0.4; reasons.append(f"PEG {peg:.2f} — growth fully priced in")
+        factors.append(_f("Valuation", clamp(val), LT_W["valuation"]))
 
-        # Sentiment (analyst targets + rating)
         s = 0.0
         if tgt and price:
-            up = (tgt-price)/price
+            up = (tgt - price) / price
             if   up > 0.30: s += 0.6; reasons.append(f"Analyst target implies +{up*100:.0f}%")
             elif up > 0.10: s += 0.3
             elif up < -0.10: s -= 0.5; reasons.append(f"Analyst target implies {up*100:.0f}%")
-        s += {"strong_buy":0.4,"buy":0.25,"hold":0.0,"underperform":-0.3,"sell":-0.4}.get(rec,0.0)
-        factors.append(_f("Sentiment", clamp(s), LT_WEIGHTS["sentiment"]))
+        factors.append(_f("Sentiment", clamp(s), LT_W["sentiment"]))
 
-    # Long-run trend / quant (applies to everything incl. ETFs)
-    ma50, ma200 = ma(closes,50), ma(closes,200)
-    tr = 0.0
+    ma50, ma200 = sma(closes,50), sma(closes,200); tr = 0.0
     if ma50 and ma200:
         if ma50 > ma200: tr += 0.4; reasons.append("Long-term uptrend intact (MA50>MA200)")
         else:            tr -= 0.4; reasons.append("Long-term downtrend (MA50<MA200)")
@@ -346,154 +346,295 @@ def long_term_signal(closes, spy, info, is_etf):
     elif mom1y < -20: tr -= 0.3; reasons.append(f"Down {abs(mom1y):.0f}% over ~1y")
     if   rs1y > 10: tr += 0.3; reasons.append(f"Beating S&P by {rs1y:.0f}% (1y)")
     elif rs1y < -10: tr -= 0.3
-    factors.append(_f("Long-term trend", clamp(tr), LT_WEIGHTS["trend"]))
+    factors.append(_f("Long-term trend", clamp(tr), LT_W["trend"]))
 
     score = round(sum(f["contrib"] for f in factors), 3)
     metrics = {}
     if not is_etf:
-        metrics = {
-            "Revenue growth %": _pct(info.get("revenueGrowth")),
-            "Earnings growth %": _pct(info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")),
-            "Net margin %": _pct(info.get("profitMargins")),
-            "ROE %": _pct(info.get("returnOnEquity")),
-            "Debt/Equity": _r(info.get("debtToEquity")),
-            "Current ratio": _r(info.get("currentRatio")),
-            "Forward P/E": _r(info.get("forwardPE") or info.get("trailingPE")),
-            "PEG": _r(info.get("pegRatio")),
-            "P/S": _r(info.get("priceToSalesTrailing12Months")),
-            "Analyst target": ("$"+str(round(info.get("targetMeanPrice"),2))) if info.get("targetMeanPrice") else "—",
-            "Rating": info.get("recommendationKey","—"),
-        }
-    metrics.update({
-        "1y return %": momentum(closes, min(252, len(closes)-1)),
-        "vs S&P (1y) %": rel_strength(closes, spy, min(252, len(closes)-1, len(spy)-1)),
-        "Max drawdown %": max_drawdown(closes),
-        "52w range pos %": pos_52w(closes),
-        "MA50": _r(ma50), "MA200": _r(ma200),
-    })
+        metrics = {"Revenue growth %": _pct(fund.get("rev")), "Earnings growth %": _pct(fund.get("earn")),
+                   "Net margin %": _pct(fund.get("pm")), "ROE %": _pct(fund.get("roe")),
+                   "Debt/Equity": _r(fund.get("de")), "Current ratio": _r(fund.get("cr")),
+                   "Forward P/E": _r(fund.get("pe")), "PEG": _r(fund.get("peg")), "P/S": _r(fund.get("ps")),
+                   "Analyst target": ("$"+str(_r(fund.get("target")))) if fund.get("target") else "—"}
+        if fund.get("edgar_rev"):
+            b = fund["edgar_rev"] / 1e9
+            metrics[f"Revenue (SEC FY{fund.get('edgar_fy','')})"] = f"${b:,.1f}B"
+    metrics.update({"1y return %": momentum(closes, min(252, len(closes)-1)),
+                    "vs S&P (1y) %": rel_strength(closes, spy, min(252, len(closes)-1, len(spy)-1)),
+                    "Max drawdown %": max_drawdown(closes), "52w range pos %": pos_52w(closes),
+                    "MA50": _r(ma50), "MA200": _r(ma200)})
     return _assemble(score, factors, reasons, metrics, price)
 
-# ── helpers to package factor + signal dicts ──────────────────────────────────
-def _f(name, sub, weight):
-    return {"name": name, "score": round(sub,2), "weight": weight,
-            "contrib": round(sub*weight,4)}
-
-def _assemble(score, factors, reasons, metrics, price):
-    c = conviction(score, factors)
-    factors_sorted = sorted(factors, key=lambda f: abs(f["contrib"]), reverse=True)
-    return {
-        "verdict": verdict(score), "score": score,
-        "conviction": c, "tier": conviction_tier(c),
-        "price": round(price,2),
-        "reasons": reasons[:8],
-        "factors": [{"name":f["name"], "score":f["score"], "weight":int(f["weight"]*100)}
-                    for f in factors_sorted],
-        "metrics": metrics,
-    }
-
-def _r(x):
-    try: return round(float(x),2)
-    except (TypeError, ValueError): return None
-
-def _pct(x):
-    try: return round(float(x)*100,1)
-    except (TypeError, ValueError): return None
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATA FETCH + ANALYSIS CYCLE
+#  FMP DATA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
-def load_universe():
-    if not USE_SP500:
-        return sorted(set(UNIVERSE))
-    try:  # optional: pull full S&P 500 (runs on your machine)
-        tbl = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        syms = [s.replace(".","-") for s in tbl["Symbol"].tolist()]
-        return sorted(set(syms + ["SPY","QQQ","VOO"]))
+def fmp(path, params=None):
+    params = dict(params or {}); params["apikey"] = FMP_KEY
+    try:
+        r = requests.get(f"{FMP_BASE}/{path}", params=params, timeout=20)
+        time.sleep(CALL_SLEEP)
+        if r.status_code == 429:
+            print("  FMP rate limit hit (429) — backing off"); return None
+        if r.status_code != 200:
+            return None
+        return r.json()
     except Exception as e:
-        print("  S&P500 load failed, using built-in list:", e)
-        return sorted(set(UNIVERSE))
+        print("  FMP error:", e); return None
 
-def get_fundamentals(sym):
-    hit = _fund_cache.get(sym)
-    if hit and datetime.now() - hit[1] < timedelta(hours=FUND_TTL_HOURS):
+def cached(key, ttl_h, fetch):
+    hit = _cache.get(key)
+    if hit and datetime.now() - hit[1] < timedelta(hours=ttl_h):
         return hit[0]
-    try:
-        info = yf.Ticker(sym).info or {}
-    except Exception:
-        info = {}
-    _fund_cache[sym] = (info, datetime.now())
-    return info
+    val = fetch()
+    if val is not None:
+        _cache[key] = (val, datetime.now())
+    elif hit:
+        return hit[0]   # serve stale on failure
+    return val
 
-def extract(df, sym, multi):
+def get_prices(sym):
+    data = fmp(f"historical-price-full/{sym}", {"timeseries": PRICE_BARS})
+    if not data or "historical" not in data: return None
+    hist = list(reversed(data["historical"]))  # oldest -> newest
+    closes = [h["close"] for h in hist if h.get("close") is not None]
+    highs  = [h.get("high", h["close"]) for h in hist if h.get("close") is not None]
+    lows   = [h.get("low",  h["close"]) for h in hist if h.get("close") is not None]
+    vols   = [h.get("volume", 0) or 0 for h in hist if h.get("close") is not None]
+    return (closes, highs, lows, vols) if len(closes) >= 60 else None
+
+# ── SEC EDGAR (official filings — primary, authenticated source, no key) ──────
+EDGAR_UA = os.environ.get("EDGAR_UA", "stock-analyzer personal-research contact@example.com")
+EDGAR_HEADERS = {"User-Agent": EDGAR_UA, "Accept-Encoding": "gzip, deflate"}
+REV_CONCEPTS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
+                "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"]
+NI_CONCEPTS  = ["NetIncomeLoss", "ProfitLoss"]
+
+def edgar_get(url):
     try:
-        sub = df[sym] if multi else df
-        sub = sub.dropna(how="all")
-        if sub.empty or "Close" not in sub: return None
-        return sub
+        r = requests.get(url, headers=EDGAR_HEADERS, timeout=25)
+        time.sleep(0.2)
+        return r.json() if r.status_code == 200 else None
     except Exception:
         return None
 
-ETF_SET = {"SPY","QQQ","VOO","VTI","SCHG","SCHD","VXUS","IWM","DIA"}
+def load_cik_map():
+    def fetch():
+        d = edgar_get("https://www.sec.gov/files/company_tickers.json")
+        if not d: return None
+        return {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in d.values()}
+    return cached("cikmap", 24, fetch)
 
-def run_cycle():
-    syms = load_universe()
-    with lock:
-        state["status"] = "fetching prices"
-        state["progress"] = {"done": 0, "total": len(syms)}
-        state["universe_size"] = len(syms)
-    print(f"\n[{datetime.now():%H:%M:%S}] Downloading {len(syms)} tickers (5y daily)…")
+def _annual_series(data, concepts):
+    """Return {year -> value} for full-year (≈365-day) facts, by period-end year."""
+    facts = data.get("facts", {}).get("us-gaap", {})
+    for c in concepts:
+        usd = (facts.get(c, {}).get("units", {}) or {}).get("USD")
+        if not usd: continue
+        by_year = {}
+        for u in usd:
+            s, e, val = u.get("start"), u.get("end"), u.get("val")
+            if not (s and e and val is not None): continue
+            try:
+                sy, sm, sd = map(int, s.split("-")); ey, em, ed = map(int, e.split("-"))
+                span = (datetime(ey, em, ed) - datetime(sy, sm, sd)).days
+            except Exception:
+                continue
+            if 350 <= span <= 380:
+                by_year[ey] = val           # later filings overwrite (restatements)
+        if by_year:
+            return by_year
+    return {}
 
-    dl = sorted(set(syms + [BENCH]))
+def get_edgar(sym):
+    def fetch():
+        m = load_cik_map()
+        if not m: return None
+        cik = m.get(sym.upper())
+        if not cik: return None
+        data = edgar_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+        if not data: return None
+        rev = _annual_series(data, REV_CONCEPTS)
+        ni  = _annual_series(data, NI_CONCEPTS)
+        if not rev: return None
+        years = sorted(rev.keys())
+        latest = years[-1]; prev = years[-2] if len(years) >= 2 else None
+        out = {"rev_latest": rev[latest], "fy": latest}
+        if prev and rev.get(prev):
+            out["rev_growth"] = (rev[latest] - rev[prev]) / rev[prev]
+        if latest in ni and rev[latest]:
+            out["net_margin"] = ni[latest] / rev[latest]
+        return out
+    return cached(f"edgar:{sym}", GROWTH_TTL_H, fetch)
+
+def get_fundamentals(sym, sector):
+    ratios = cached(f"ratios:{sym}", RATIOS_TTL_H,
+                    lambda: fmp(f"ratios-ttm/{sym}"))
+    growth = cached(f"growth:{sym}", GROWTH_TTL_H,
+                    lambda: fmp(f"financial-growth/{sym}", {"period": "annual", "limit": 1}))
+    target = cached(f"target:{sym}", TARGET_TTL_H,
+                    lambda: fmp(f"price-target-consensus", {"symbol": sym}))
+
+    r = (ratios[0] if isinstance(ratios, list) and ratios else {}) or {}
+    g = (growth[0] if isinstance(growth, list) and growth else {}) or {}
+    t = (target[0] if isinstance(target, list) and target else {}) or {}
+
+    def pick(d, *keys):
+        for k in keys:
+            if d.get(k) not in (None, ""):
+                try: return float(d[k])
+                except (TypeError, ValueError): pass
+        return 0.0
+
+    fund = {
+        "rev":  pick(g, "growthRevenue", "revenueGrowth"),
+        "earn": pick(g, "growthNetIncome", "epsgrowth", "growthEPS"),
+        "pm":   pick(r, "netProfitMarginTTM", "netProfitMargin"),
+        "roe":  pick(r, "returnOnEquityTTM", "returnOnEquity"),
+        "roa":  pick(r, "returnOnAssetsTTM", "returnOnAssets"),
+        "de":   pick(r, "debtEquityRatioTTM", "debtToEquityTTM", "debtEquityRatio"),
+        "cr":   pick(r, "currentRatioTTM", "currentRatio"),
+        "fcfy": pick(r, "freeCashFlowYieldTTM", "freeCashFlowYield"),
+        "pe":   pick(r, "peRatioTTM", "priceEarningsRatioTTM", "peRatio"),
+        "peg":  pick(r, "pegRatioTTM", "priceEarningsToGrowthRatioTTM", "pegRatio"),
+        "ps":   pick(r, "priceToSalesRatioTTM", "priceSalesRatioTTM"),
+        "target": pick(t, "targetConsensus", "targetMean", "priceTargetAverage"),
+        "growth_sector": sector in ("Technology", "Communication Services", "Consumer Cyclical"),
+    }
+
+    # ── cross-check / ground against official SEC EDGAR filings ──────────────
+    edgar = get_edgar(sym)
+    confidence = "FMP data"; edgar_rev = None; edgar_fy = None; flag = None
+    if edgar:
+        edgar_fy = edgar.get("fy"); edgar_rev = edgar.get("rev_latest")
+        confidence = "SEC-verified"
+        fmp_rev_growth = fund["rev"]
+        if edgar.get("rev_growth") is not None:
+            # prefer the official filing figure for revenue growth
+            if fmp_rev_growth and abs(fmp_rev_growth - edgar["rev_growth"]) > 0.15:
+                flag = "FMP & SEC differ on revenue growth — verify"
+            fund["rev"] = edgar["rev_growth"]
+        if edgar.get("net_margin") is not None:
+            fund["pm"] = edgar["net_margin"]
+    fund["confidence"] = confidence
+    fund["flag"] = flag
+    fund["edgar_rev"] = edgar_rev
+    fund["edgar_fy"] = edgar_fy
+    return fund
+
+# ── Finnhub: aggregated Wall Street analyst consensus (free tier) ─────────────
+def finnhub_get(path, params=None):
+    params = dict(params or {}); params["token"] = FINNHUB_KEY
     try:
-        df = yf.download(dl, period=HISTORY_PERIOD, interval="1d",
-                         group_by="ticker", auto_adjust=True, threads=True, progress=False)
-    except Exception as e:
-        print("  bulk download failed:", e)
-        with lock: state["status"] = "error"
-        return
-    multi = isinstance(df.columns, pd.MultiIndex)
+        r = requests.get(f"https://finnhub.io/api/v1/{path}", params=params, timeout=20)
+        time.sleep(0.1)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
 
-    spy_sub = extract(df, BENCH, multi)
-    spy = spy_sub["Close"].dropna().values if spy_sub is not None else np.ones(300)
+def get_consensus(sym):
+    if not FINNHUB_KEY:
+        return None
+    data = cached(f"cons:{sym}", RATIOS_TTL_H,
+                  lambda: finnhub_get("stock/recommendation", {"symbol": sym}))
+    if not isinstance(data, list) or not data:
+        return None
+    d = max(data, key=lambda x: x.get("period", ""))   # most recent month
+    sb = d.get("strongBuy",0); b = d.get("buy",0); h = d.get("hold",0)
+    s = d.get("sell",0); ss = d.get("strongSell",0)
+    total = sb + b + h + s + ss
+    if total == 0:
+        return None
+    score = (sb*1 + b*0.5 + h*0 - s*0.5 - ss*1) / total
+    return {"buy": sb+b, "hold": h, "sell": s+ss, "total": total,
+            "verdict": verdict(score), "score": round(score, 3)}
+
+# ── Market regime (computed macro signal from the broad market) ───────────────
+def market_regime(spy):
+    ma200 = sma(spy, 200); price = spy[-1]
+    mom = momentum(spy, min(126, len(spy)-1)); vol = ann_vol(spy)
+    score = 0.0; notes = []
+    if ma200 and price > ma200: score += 0.5; notes.append("S&P above its 200-day average")
+    elif ma200:                 score -= 0.5; notes.append("S&P below its 200-day average")
+    if   mom > 5:  score += 0.3; notes.append(f"S&P +{mom:.0f}% over ~6mo")
+    elif mom < -5: score -= 0.3; notes.append(f"S&P {mom:.0f}% over ~6mo")
+    if vol and vol > 25: score -= 0.2; notes.append(f"elevated volatility ({vol:.0f}%/yr)")
+    score = clamp(score)
+    regime = "Risk-on" if score > 0.3 else ("Risk-off" if score < -0.3 else "Neutral")
+    return {"regime": regime, "score": round(score, 2), "note": "; ".join(notes) or "mixed"}
+
+# ── Combined view: model (ST+LT) + analyst consensus + macro, with agreement ──
+def combined_view(st, lt, cons, macro_score):
+    factors = [{"contrib": lt["score"]*0.35}, {"contrib": st["score"]*0.25}]
+    opinions = [lt["score"], st["score"]]
+    if cons:
+        factors.append({"contrib": cons["score"]*0.30}); opinions.append(cons["score"])
+    factors.append({"contrib": macro_score*0.10})       # macro = context nudge only
+    score = round(sum(f["contrib"] for f in factors), 3)
+    dirs = [1 if o > 0.05 else (-1 if o < -0.05 else 0) for o in opinions]
+    nz = [d for d in dirs if d != 0]
+    if not nz:        label = "No clear edge"
+    elif all(d == nz[0] for d in nz): label = "Aligned"
+    else:             label = "Mixed signals"
+    return {"verdict": verdict(score), "score": score,
+            "confidence": conviction(score, factors), "label": label,
+            "has_analyst": bool(cons)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ANALYSIS CYCLE
+# ══════════════════════════════════════════════════════════════════════════════
+def run_cycle():
+    if not FMP_KEY:
+        with lock: state["status"] = "no_api_key"
+        print("  ⚠ FMP_API_KEY is not set — add it as an environment variable.")
+        return
+
+    with lock:
+        state["status"] = "fetching"
+        state["progress"] = {"done": 0, "total": len(UNIVERSE)}
+    print(f"\n[{datetime.now():%H:%M:%S}] Analyzing {len(UNIVERSE)} stocks via FMP…")
+
+    spy_p = get_prices(BENCH)
+    spy = spy_p[0] if spy_p else [1.0] * 300
+    macro = market_regime(spy)
+    with lock:
+        state["macro"] = macro
 
     new = {}; sectors = set(); done = 0
-    for sym in syms:
+    for u in UNIVERSE:
+        sym = u["sym"]
         try:
-            sub = extract(df, sym, multi)
-            if sub is None or len(sub["Close"].dropna()) < 60:
-                done += 1; continue
-            closes = sub["Close"].dropna().values
-            highs  = sub["High"].dropna().values
-            lows   = sub["Low"].dropna().values
-            vols   = sub["Volume"].dropna().values
-            is_etf = sym in ETF_SET
-            info   = {} if is_etf else get_fundamentals(sym)
-            name   = info.get("shortName") or info.get("longName") or sym
-            sector = "ETF / Fund" if is_etf else (info.get("sector") or "—")
-            sectors.add(sector)
-
-            day_chg = round((closes[-1]-closes[-2])/closes[-2]*100, 2) if len(closes) > 1 else 0.0
-            st = short_term_signal(closes, highs, lows, vols, spy)
-            lt = long_term_signal(closes, spy, info, is_etf)
-
-            new[sym] = {"name": name, "sector": sector, "price": round(float(closes[-1]),2),
-                        "day_change": day_chg, "st": st, "lt": lt}
+            pr = get_prices(sym)
+            if pr:
+                closes, highs, lows, vols = pr
+                fund = {} if u["etf"] else get_fundamentals(sym, u["sector"])
+                st = short_term_signal(closes, highs, lows, vols, spy)
+                lt = long_term_signal(closes, spy, fund, u["etf"])
+                cons = None if u["etf"] else get_consensus(sym)
+                combined = combined_view(st, lt, cons, macro["score"])
+                day_chg = round((closes[-1]-closes[-2])/closes[-2]*100, 2) if len(closes) > 1 else 0.0
+                new[sym] = {"name": u["name"], "sector": u["sector"],
+                            "price": round(closes[-1], 2), "day_change": day_chg,
+                            "data_confidence": ("n/a (ETF)" if u["etf"] else fund.get("confidence", "FMP data")),
+                            "flag": (None if u["etf"] else fund.get("flag")),
+                            "consensus": cons, "combined": combined,
+                            "st": st, "lt": lt}
+                sectors.add(u["sector"])
         except Exception as e:
             print(f"  {sym}: {e}")
         finally:
             done += 1
-            if done % 10 == 0 or done == len(syms):
+            if done % 5 == 0 or done == len(UNIVERSE):
                 with lock:
                     state["signals"] = dict(new)
-                    state["progress"] = {"done": done, "total": len(syms)}
+                    state["progress"] = {"done": done, "total": len(UNIVERSE)}
                     state["status"] = "analyzing"
 
     with lock:
         state["signals"] = new
-        state["sectors"] = sorted(s for s in sectors if s)
+        state["sectors"] = sorted(sectors)
         state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        state["status"] = "running"
-        state["progress"] = {"done": len(syms), "total": len(syms)}
+        state["status"] = "running" if new else "error"
+        state["progress"] = {"done": len(UNIVERSE), "total": len(UNIVERSE)}
     print(f"  ✓ analyzed {len(new)} stocks.")
 
 def loop():
@@ -501,6 +642,17 @@ def loop():
         try: run_cycle()
         except Exception as e: print("cycle error:", e)
         time.sleep(POLL_INTERVAL)
+
+# start the background worker once, at import time, so it runs under gunicorn too
+_worker_started = False
+def start_worker():
+    global _worker_started
+    with lock:
+        if _worker_started: return
+        _worker_started = True
+    threading.Thread(target=loop, daemon=True).start()
+
+start_worker()
 
 # ── routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -518,10 +670,11 @@ def api_refresh():
     return jsonify({"message": "refresh started"})
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5001))
     print("="*60)
-    print("  US Stock Analyzer  ·  Short-Term (1–3wk) + Long-Term (5y)")
-    print(f"  Universe: {len(load_universe())} stocks  ·  analysis only, no trades")
-    print("  Dashboard → http://localhost:5001/")
+    print("  US Stock Analyzer (hosted edition · FMP data)")
+    print(f"  Universe: {len(UNIVERSE)} stocks  ·  analysis only, no trades")
+    print(f"  API key set: {'yes' if FMP_KEY else 'NO — set FMP_API_KEY'}")
+    print(f"  Dashboard → http://localhost:{port}/")
     print("="*60)
-    threading.Thread(target=loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
