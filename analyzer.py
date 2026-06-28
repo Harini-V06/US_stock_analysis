@@ -1,39 +1,76 @@
 """
-US Stock Analyzer — hosted edition (Financial Modeling Prep data)
+US Stock Analyzer — dual-horizon edition
 
-Dual-horizon analysis only (no trading, no mock data):
-• Short-term (1–3 weeks) : technical + quant
-• Long-term (5 years)    : fundamentals + valuation + trend
+Data source : Financial Modeling Prep (FMP) API + SEC EDGAR (no key needed)
+Dashboard   : Flask, served at http://localhost:5001/
+Analysis    : short-term technicals (1–3 weeks) + long-term fundamentals (5-year view)
+No trading  : analysis and scoring only — no orders, no mock data, no paper trading
 
-Designed to run on a free host (e.g. Render) behind gunicorn, with data from
-Financial Modeling Prep (FMP). Reads the API key from the FMP_API_KEY
-environment variable — the key is NEVER hard-coded.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REQUIRED ENVIRONMENT VARIABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FMP_API_KEY   (required)  — Financial Modeling Prep key.
+                            Free tier = 250 req/day; universe is ~56 stocks,
+                            one full cycle ≈ 200 calls. Upgrade for more stocks
+                            or faster refresh. https://financialmodelingprep.com
 
-Honest notes (shown in the UI too):
-• "Conviction" = how strongly the factors agree (capped 80%), NOT the
-  probability the call is right.
-• Free FMP plan = 250 requests/day, so the universe is ~50 stocks and data
-  refreshes about once a day. Both are easy to raise on a paid tier.
-• Indicators are computed in pure Python — no numpy/pandas — so the host
-  build is tiny and fast.
+OPTIONAL ENVIRONMENT VARIABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINNHUB_API_KEY  — Finnhub key for Wall St. analyst buy/hold/sell consensus.
+                   Without it, the Consensus column in the dashboard is hidden.
+                   Free tier is sufficient. https://finnhub.io
 
-PATCH 01 applied:
-• Verdicts are now assigned by universe-wide percentile rank, not fixed
-  raw-score thresholds. This makes BUY/SELL meaningful regardless of whether
-  the whole market is trending up or down.
-• Percentile bands shift ±8 pct-points based on the macro regime score.
-• pct_rank (0–100) is exposed on each horizon signal for the UI to display.
+EDGAR_UA         — User-Agent string sent to SEC EDGAR (required by SEC ToS).
+                   Default: "stock-analyzer personal-research contact@example.com"
+                   Format:  "<app-name> <purpose> <contact-email>"
+                   SEC EDGAR is used to cross-check FMP revenue figures against
+                   official XBRL filings. No API key needed.
 
-Local run:
+POLL_INTERVAL    — Seconds between full re-analysis cycles (default: 86400 = 1 day).
+                   Free FMP plan: keep at 86400 or higher to stay within quota.
+
+FETCH_WORKERS    — Parallel fetch threads per cycle (default: 6).
+                   Higher = faster cycle; be mindful of FMP rate limits.
+
+PORT             — Flask port (default: 5001).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK START (Windows PowerShell)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     pip install flask flask-cors requests
-    set FMP_API_KEY=your_key   (PowerShell: $env:FMP_API_KEY="your_key")
+    $env:FMP_API_KEY = "your_key_here"
+    $env:FINNHUB_API_KEY = "your_key_here"   # optional
     python analyzer.py
+
+QUICK START (bash / Linux / Mac)
+    pip install flask flask-cors requests
+    export FMP_API_KEY="your_key_here"
+    export FINNHUB_API_KEY="your_key_here"   # optional
+    python analyzer.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PATCHES APPLIED (all patches are in this file)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+01  Percentile-based verdicts   — BUY/SELL relative to universe, not fixed thresholds
+02  Volume direction fix        — uses actual price direction (close vs prior close)
+03  Sector-relative P/E         — scores vs live sector median, not hardcoded bands
+04  Missing data tracking       — distinguishes zero vs absent; discounts sparse LT scores
+05  Robust MACD crossover       — held-sign detection avoids whipsaw on choppy stocks
+06  Parallel fetch              — ThreadPoolExecutor with per-symbol timeout
+
+HONEST NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• "Conviction" = factor agreement strength, capped at 80%. NOT win probability.
+• Verdicts are relative ranks within the current universe, not absolute calls.
+• Free FMP = 250 req/day. Default universe (56 stocks) uses ~200 calls/cycle.
+• Indicators are pure Python (no numpy/pandas) — small deploy footprint.
 """
 
 import os
 import time
 import math
 import threading
+import concurrent.futures as _cf
 from datetime import datetime, timedelta
 
 import requests
@@ -55,7 +92,12 @@ RATIOS_TTL_H  = 24          # fundamentals cache (hours)
 GROWTH_TTL_H  = 24 * 7     # growth cache (weekly)
 TARGET_TTL_H  = 24 * 7     # analyst target cache (weekly)
 PRICE_BARS    = 400         # daily bars to pull (enough for MA200 + 1y momentum)
-CALL_SLEEP    = 0.25        # gentle pause between API calls
+CALL_SLEEP    = 0.25        # gentle pause between API calls per worker
+
+# Parallel fetch workers (PATCH 06).
+# 6 workers cut cycle time from ~20 min to ~3 min on the free FMP plan.
+# Raise via FETCH_WORKERS env var on a paid plan.
+_FETCH_WORKERS = int(os.environ.get("FETCH_WORKERS", 6))
 
 # ── Universe (~56 liquid names; name+sector embedded so we spend 0 calls on it)
 U = [
@@ -245,13 +287,58 @@ def rsi(v, period=14):
     rs = ag / (al or 1e-9)
     return round(100 - 100 / (1 + rs), 2)
 
-def macd(v):
+def macd(v, confirm_bars=3):
+    """
+    MACD with robust crossover detection (PATCH 05).
+
+    Replaces the brittle 3-bar lookback (line[-3] <= sig[-3]) with
+    held-sign detection:
+
+    1. Find the index of the most recent sign-change in (line - signal).
+    2. Count how many bars the new side has held (bars_since_cross).
+    3. Count how many bars the previous side held before the cross (prev_run).
+    4. A valid crossover requires:
+         • bars_since_cross in [1, confirm_bars+1]  — recent enough to act on
+         • prev_run >= confirm_bars                 — previous side was stable
+                                                      (suppresses choppy whipsaw)
+
+    This correctly handles:
+      - Clean trend reversals  → fires once, expires after confirm_bars bars
+      - Choppy oscillation     → prev_run is tiny, so valid=False (no signal)
+      - Slow crosses           → the +1 buffer handles gradual crossovers
+    """
     if len(v) < 35: return 0.0, 0.0, False, False
     e12  = ema_series(v, 12); e26 = ema_series(v, 26)
     line = [a - b for a, b in zip(e12, e26)]
     sig  = ema_series(line, 9)
-    up   = line[-1] > sig[-1] and line[-3] <= sig[-3]
-    dn   = line[-1] < sig[-1] and line[-3] >= sig[-3]
+    diff = [l - s for l, s in zip(line, sig)]
+
+    curr_sign = diff[-1] > 0
+
+    # Walk back to find the most recent sign-change
+    last_cross_idx = None
+    for i in range(len(diff) - 2, -1, -1):
+        if (diff[i] > 0) != curr_sign:
+            last_cross_idx = i
+            break
+
+    if last_cross_idx is None:
+        return round(line[-1], 3), round(sig[-1], 3), False, False
+
+    bars_since_cross = (len(diff) - 1) - last_cross_idx
+
+    # How long the previous side held before the cross (stability check)
+    prev_sign = not curr_sign
+    prev_run  = 0
+    for i in range(last_cross_idx, -1, -1):
+        if (diff[i] > 0) == prev_sign:
+            prev_run += 1
+        else:
+            break
+
+    valid = (1 <= bars_since_cross <= confirm_bars + 1) and (prev_run >= confirm_bars)
+    up    = valid and curr_sign
+    dn    = valid and not curr_sign
     return round(line[-1], 3), round(sig[-1], 3), up, dn
 
 def stdev(v):
@@ -422,8 +509,11 @@ def short_term_signal(closes, highs, lows, vols, spy):
     return _assemble(score, factors, reasons, metrics, price)
 
 
-def long_term_signal(closes, spy, fund, is_etf):
+def long_term_signal(closes, spy, fund, is_etf, sector_pe_map=None):
     price = closes[-1]; factors = []; reasons = []
+    coverage     = fund.get("data_coverage",  100) if not is_etf else 100
+    missing      = fund.get("missing_fields", [])  if not is_etf else []
+    low_coverage = (not is_etf) and coverage < 60
 
     if is_etf:
         for k in ("growth", "profit", "health", "valuation", "sentiment"):
@@ -436,7 +526,7 @@ def long_term_signal(closes, spy, fund, is_etf):
         cr   = fund.get("cr",     0); fcfy = fund.get("fcfy",   0)
         pe   = fund.get("pe",     0); peg  = fund.get("peg",    0)
         ps   = fund.get("ps",     0); tgt  = fund.get("target", 0)
-        growth_sector = fund.get("growth_sector", False)
+        sector = fund.get("sector", "")
 
         # Growth
         g = 0.0
@@ -471,16 +561,45 @@ def long_term_signal(closes, spy, fund, is_etf):
         elif 0 < cr < 1:   h -= 0.3; reasons.append("Weak liquidity (current ratio < 1)")
         factors.append(_f("Financial health", clamp(h), LT_W["health"]))
 
-        # Valuation
+        # ── Valuation (PATCH 03: sector-relative P/E) ────────────────────────
+        # Instead of fixed universal bands, we score pe relative to the live
+        # sector median fetched from FMP (or the hardcoded fallback).
+        #
+        # Bands are set at:
+        #   cheap  = sector_median × 0.75  (25% discount → clearly cheap)
+        #   fair   = sector_median × 1.00  (at sector norm)
+        #   rich   = sector_median × 1.40  (40% premium → clearly expensive)
+        #   very_rich = sector_median × 1.75
+        #
+        # This means a Tech stock at P/E 26 next to a sector median of 35
+        # scores as "attractive", while a Utility at P/E 26 next to a sector
+        # median of 18 scores as "expensive" — which is correct.
         val = 0.0
-        cheap, fair, rich = (30, 50, 80) if growth_sector else (18, 30, 55)
+        spe_map   = sector_pe_map or _SECTOR_PE_FALLBACK
+        sector_pe = spe_map.get(sector) or spe_map.get("Consumer Defensive", 22.0)
+
+        cheap     = sector_pe * 0.75
+        fair      = sector_pe * 1.00
+        rich      = sector_pe * 1.40
+        very_rich = sector_pe * 1.75
+
         if pe > 0:
-            if pe < cheap:   val += 0.6; reasons.append(f"Attractive P/E {pe:.0f}")
-            elif pe < fair:  val += 0.2
-            elif pe > rich:  val -= 0.6; reasons.append(f"Expensive P/E {pe:.0f}")
-            elif pe > fair:  val -= 0.2
+            if pe < cheap:
+                val += 0.6
+                reasons.append(f"P/E {pe:.0f} well below sector median {sector_pe:.0f} — attractive")
+            elif pe < fair:
+                val += 0.2
+                reasons.append(f"P/E {pe:.0f} below sector median {sector_pe:.0f}")
+            elif pe > very_rich:
+                val -= 0.6
+                reasons.append(f"P/E {pe:.0f} far above sector median {sector_pe:.0f} — expensive")
+            elif pe > rich:
+                val -= 0.2
+                reasons.append(f"P/E {pe:.0f} above sector median {sector_pe:.0f}")
+            # between fair and rich = neutral (no reason appended, val stays 0)
+
         if peg > 0:
-            if peg < 1:  val += 0.4; reasons.append(f"PEG {peg:.2f} < 1 — cheap vs growth")
+            if peg < 1:   val += 0.4; reasons.append(f"PEG {peg:.2f} < 1 — cheap vs growth")
             elif peg > 3: val -= 0.4; reasons.append(f"PEG {peg:.2f} — growth fully priced in")
         factors.append(_f("Valuation", clamp(val), LT_W["valuation"]))
 
@@ -533,7 +652,24 @@ def long_term_signal(closes, spy, fund, is_etf):
         "MA50":              _r(ma50),
         "MA200":             _r(ma200),
     })
-    return _assemble(score, factors, reasons, metrics, price)
+
+    # PATCH 04: low data coverage — warn and discount score toward zero.
+    # A stock with only 3/9 fundamental fields available (new IPO, spin-off,
+    # foreign filer) should not get a confident LT signal based on zeros.
+    if low_coverage:
+        reasons.insert(0, f"⚠ Low data coverage ({coverage}%) — "
+                          f"missing: {', '.join(missing[:4])}. LT score discounted.")
+        # Discount: blend toward 0 proportionally to how much data is missing.
+        # At 0% coverage the score becomes 0; at 59% coverage it's ~40% discounted.
+        discount = coverage / 100.0
+        score    = round(score * discount, 3)
+
+    if not is_etf:
+        metrics["Data coverage %"] = coverage
+
+    result = _assemble(score, factors, reasons, metrics, price)
+    result["low_coverage"] = low_coverage   # flag for dashboard warning badge
+    return result
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FMP DATA LAYER
@@ -661,28 +797,46 @@ def get_fundamentals(sym, sector):
     g = (growth[0] if isinstance(growth, list) and growth else {}) or {}
     t = (target[0] if isinstance(target, list) and target else {}) or {}
 
-    def pick(d, *keys):
+    # PATCH 04: track which fields are genuinely present vs silently missing.
+    # pick() returns (value, found) so we know whether a 0.0 is real data or
+    # just an absent field. missing_fields drives a data_coverage warning shown
+    # in the UI — a stock with 6/9 fields missing should say so, not pretend
+    # its LT score is based on full fundamentals.
+    missing_fields = []
+
+    def pick(d, field_label, *keys):
         for k in keys:
             if d.get(k) not in (None, ""):
                 try:   return float(d[k])
                 except (TypeError, ValueError): pass
+        missing_fields.append(field_label)
         return 0.0
 
     fund = {
-        "rev":    pick(g, "growthRevenue",    "revenueGrowth"),
-        "earn":   pick(g, "growthNetIncome",  "epsgrowth",        "growthEPS"),
-        "pm":     pick(r, "netProfitMarginTTM",   "netProfitMargin"),
-        "roe":    pick(r, "returnOnEquityTTM",    "returnOnEquity"),
-        "roa":    pick(r, "returnOnAssetsTTM",    "returnOnAssets"),
-        "de":     pick(r, "debtEquityRatioTTM",   "debtToEquityTTM",   "debtEquityRatio"),
-        "cr":     pick(r, "currentRatioTTM",      "currentRatio"),
-        "fcfy":   pick(r, "freeCashFlowYieldTTM", "freeCashFlowYield"),
-        "pe":     pick(r, "peRatioTTM",           "priceEarningsRatioTTM", "peRatio"),
-        "peg":    pick(r, "pegRatioTTM",          "priceEarningsToGrowthRatioTTM", "pegRatio"),
-        "ps":     pick(r, "priceToSalesRatioTTM", "priceSalesRatioTTM"),
-        "target": pick(t, "targetConsensus",      "targetMean",        "priceTargetAverage"),
+        "rev":    pick(g, "revenue growth",    "growthRevenue",    "revenueGrowth"),
+        "earn":   pick(g, "earnings growth",   "growthNetIncome",  "epsgrowth",        "growthEPS"),
+        "pm":     pick(r, "net margin",        "netProfitMarginTTM",   "netProfitMargin"),
+        "roe":    pick(r, "ROE",               "returnOnEquityTTM",    "returnOnEquity"),
+        "roa":    pick(r, "ROA",               "returnOnAssetsTTM",    "returnOnAssets"),
+        "de":     pick(r, "debt/equity",       "debtEquityRatioTTM",   "debtToEquityTTM",   "debtEquityRatio"),
+        "cr":     pick(r, "current ratio",     "currentRatioTTM",      "currentRatio"),
+        "fcfy":   pick(r, "FCF yield",         "freeCashFlowYieldTTM", "freeCashFlowYield"),
+        "pe":     pick(r, "P/E",               "peRatioTTM",           "priceEarningsRatioTTM", "peRatio"),
+        "peg":    pick(r, "PEG",               "pegRatioTTM",          "priceEarningsToGrowthRatioTTM", "pegRatio"),
+        "ps":     pick(r, "P/S",               "priceToSalesRatioTTM", "priceSalesRatioTTM"),
+        "target": pick(t, "analyst target",    "targetConsensus",      "targetMean",        "priceTargetAverage"),
         "growth_sector": sector in ("Technology", "Communication Services", "Consumer Cyclical"),
+        "sector":        sector,
     }
+
+    # Coverage score: fraction of the 9 core fields that were actually present.
+    # PEG and P/S are optional extras, so we track 9 core fields.
+    CORE_FIELDS = {"revenue growth", "earnings growth", "net margin", "ROE",
+                   "debt/equity", "current ratio", "FCF yield", "P/E", "analyst target"}
+    core_missing = [f for f in missing_fields if f in CORE_FIELDS]
+    coverage_pct = round((len(CORE_FIELDS) - len(core_missing)) / len(CORE_FIELDS) * 100)
+    fund["data_coverage"]   = coverage_pct          # 0–100 %
+    fund["missing_fields"]  = core_missing          # list shown in UI warning
 
     # ── Cross-check / ground against official SEC EDGAR filings ──────────────
     edgar      = get_edgar(sym)
@@ -734,6 +888,82 @@ def get_consensus(sym):
         "buy": sb+b, "hold": h, "sell": s+ss, "total": total,
         "verdict": verdict(score), "score": round(score, 3),
     }
+
+# ── Sector P/E map (fetched once per cycle, cached 24h) ──────────────────────
+#
+# FMP's /sector_price_earning_ratio endpoint returns the current TTM P/E
+# median for each GICS sector. We use this to score each stock's P/E
+# relative to its own sector norm rather than hard-coded universal bands.
+#
+# Fallback table (used when the API call fails or a sector is missing).
+# Values are long-run medians — conservative enough to be safe as defaults.
+_SECTOR_PE_FALLBACK = {
+    "Technology":              35.0,
+    "Communication Services":  22.0,
+    "Consumer Cyclical":       25.0,
+    "Consumer Defensive":      22.0,
+    "Healthcare":              24.0,
+    "Financial Services":      14.0,
+    "Industrials":             21.0,
+    "Energy":                  12.0,
+    "Utilities":               18.0,
+    "Real Estate":             30.0,
+    "Basic Materials":         15.0,
+    "ETF / Fund":              22.0,
+}
+
+# FMP sector name → our sector label
+_FMP_SECTOR_NAME_MAP = {
+    "Technology":             "Technology",
+    "Communication Services": "Communication Services",
+    "Consumer Cyclical":      "Consumer Cyclical",
+    "Consumer Defensive":     "Consumer Defensive",
+    "Healthcare":             "Healthcare",
+    "Financial Services":     "Financial Services",
+    "Financials":             "Financial Services",
+    "Industrials":            "Industrials",
+    "Energy":                 "Energy",
+    "Utilities":              "Utilities",
+    "Real Estate":            "Real Estate",
+    "Basic Materials":        "Basic Materials",
+    "Materials":              "Basic Materials",
+}
+
+
+def get_sector_pe_map():
+    """
+    Fetch TTM P/E medians per sector from FMP (PATCH 03).
+    Returns dict: sector_label -> median_pe (float).
+    Falls back gracefully to _SECTOR_PE_FALLBACK on any failure.
+    Cached 24 h to avoid burning daily API quota.
+    """
+    def fetch():
+        data = fmp("sector_price_earning_ratio", {"date": "", "exchange": "NYSE"})
+        if not isinstance(data, list) or not data:
+            return None
+        out = {}
+        for row in data:
+            fmp_name = row.get("sector", "")
+            pe_val   = row.get("pe")
+            our_name = _FMP_SECTOR_NAME_MAP.get(fmp_name)
+            if our_name and pe_val:
+                try:
+                    pe_f = float(pe_val)
+                    if 3.0 < pe_f < 300.0:   # sanity-check: reject negative or absurd values
+                        out[our_name] = round(pe_f, 1)
+                except (TypeError, ValueError):
+                    pass
+        return out if out else None
+
+    result = cached("sector_pe_map", 24, fetch)
+    if not result:
+        return dict(_SECTOR_PE_FALLBACK)
+
+    # Fill any sectors missing from the API response with fallback values
+    merged = dict(_SECTOR_PE_FALLBACK)
+    merged.update(result)
+    return merged
+
 
 # ── Market regime (computed macro signal from the broad market) ───────────────
 def market_regime(spy):
@@ -791,46 +1021,73 @@ def run_cycle():
     spy   = spy_p[0] if spy_p else [1.0] * 300
     macro = market_regime(spy)
 
+    # Fetch sector P/E map once for the whole cycle (PATCH 03)
+    sector_pe_map = get_sector_pe_map()
+    print(f"  Sector P/E map: {len(sector_pe_map)} sectors loaded "
+          f"({'live' if sector_pe_map != _SECTOR_PE_FALLBACK else 'fallback'})")
+
     with lock:
         state["macro"] = macro
 
-    new     = {}; sectors = set(); done = 0
+    new     = {}; sectors = set()
+    new_lock = threading.Lock()   # protects `new` and `sectors` across workers
 
-    for u in UNIVERSE:
+    def analyze_one(u):
+        """Fetch + score one ticker. Returns (sym, result_dict) or (sym, None)."""
         sym = u["sym"]
         try:
             pr = get_prices(sym)
-            if pr:
-                closes, highs, lows, vols = pr
-                fund     = {} if u["etf"] else get_fundamentals(sym, u["sector"])
-                st       = short_term_signal(closes, highs, lows, vols, spy)
-                lt       = long_term_signal(closes, spy, fund, u["etf"])
-                cons     = None if u["etf"] else get_consensus(sym)
-                combined = combined_view(st, lt, cons, macro["score"])
-                day_chg  = round((closes[-1]-closes[-2])/closes[-2]*100, 2) if len(closes) > 1 else 0.0
-
-                new[sym] = {
-                    "name":            u["name"],
-                    "sector":          u["sector"],
-                    "price":           round(closes[-1], 2),
-                    "day_change":      day_chg,
-                    "data_confidence": ("n/a (ETF)" if u["etf"] else fund.get("confidence", "FMP data")),
-                    "flag":            (None if u["etf"] else fund.get("flag")),
-                    "consensus":       cons,
-                    "combined":        combined,
-                    "st":              st,
-                    "lt":              lt,
-                }
-                sectors.add(u["sector"])
+            if not pr:
+                return sym, None
+            closes, highs, lows, vols = pr
+            fund     = {} if u["etf"] else get_fundamentals(sym, u["sector"])
+            st       = short_term_signal(closes, highs, lows, vols, spy)
+            lt       = long_term_signal(closes, spy, fund, u["etf"], sector_pe_map)
+            cons     = None if u["etf"] else get_consensus(sym)
+            combined = combined_view(st, lt, cons, macro["score"])
+            day_chg  = round((closes[-1]-closes[-2])/closes[-2]*100, 2) if len(closes) > 1 else 0.0
+            return sym, {
+                "name":            u["name"],
+                "sector":          u["sector"],
+                "price":           round(closes[-1], 2),
+                "day_change":      day_chg,
+                "data_confidence": ("n/a (ETF)" if u["etf"] else fund.get("confidence", "FMP data")),
+                "flag":            (None if u["etf"] else fund.get("flag")),
+                "consensus":       cons,
+                "combined":        combined,
+                "st":              st,
+                "lt":              lt,
+            }
         except Exception as e:
             print(f"  {sym}: {e}")
-        finally:
-            done += 1
-            if done % 5 == 0 or done == len(UNIVERSE):
-                with lock:
-                    state["signals"]  = dict(new)
-                    state["progress"] = {"done": done, "total": len(UNIVERSE)}
-                    state["status"]   = "analyzing"
+            return sym, None
+
+    # PATCH 06: parallel fetch with per-symbol timeout.
+    # Each worker calls analyze_one(); if a single FMP call hangs, the timeout
+    # (90 s) kills just that future — the rest of the cycle continues normally.
+    done_count = 0
+    with _cf.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+        futures = {pool.submit(analyze_one, u): u for u in UNIVERSE}
+        for fut in _cf.as_completed(futures, timeout=120):
+            try:
+                sym, result = fut.result(timeout=90)
+                if result:
+                    with new_lock:
+                        new[sym] = result
+                        sectors.add(result["sector"])
+            except _cf.TimeoutError:
+                u = futures[fut]
+                print(f"  {u['sym']}: timed out — skipped")
+            except Exception as e:
+                u = futures[fut]
+                print(f"  {u['sym']}: worker error — {e}")
+            finally:
+                done_count += 1
+                if done_count % 5 == 0 or done_count == len(UNIVERSE):
+                    with lock:
+                        state["signals"]  = dict(new)
+                        state["progress"] = {"done": done_count, "total": len(UNIVERSE)}
+                        state["status"]   = "analyzing"
 
     # ── PATCH 01: re-assign verdicts using universe percentile ranks ──────────
     normalize_verdicts(new, macro.get("score", 0.0) if macro else 0.0)
