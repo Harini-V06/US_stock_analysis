@@ -21,9 +21,6 @@ FINNHUB_API_KEY  — Finnhub key for Wall St. analyst buy/hold/sell consensus.
 
 EDGAR_UA         — User-Agent string sent to SEC EDGAR (required by SEC ToS).
                    Default: "stock-analyzer personal-research contact@example.com"
-                   Format:  "<app-name> <purpose> <contact-email>"
-                   SEC EDGAR is used to cross-check FMP revenue figures against
-                   official XBRL filings. No API key needed.
 
 POLL_INTERVAL    — Seconds between full re-analysis cycles (default: 86400 = 1 day).
                    Free FMP plan: keep at 86400 or higher to stay within quota.
@@ -47,15 +44,6 @@ QUICK START (bash / Linux / Mac)
     export FINNHUB_API_KEY="your_key_here"   # optional
     python analyzer.py
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PATCHES APPLIED (all patches are in this file)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-01  Percentile-based verdicts   — BUY/SELL relative to universe, not fixed thresholds
-02  Volume direction fix        — uses actual price direction (close vs prior close)
-03  Sector-relative P/E         — scores vs live sector median, not hardcoded bands
-04  Missing data tracking       — distinguishes zero vs absent; discounts sparse LT scores
-05  Robust MACD crossover       — held-sign detection avoids whipsaw on choppy stocks
-06  Parallel fetch              — ThreadPoolExecutor with per-symbol timeout
 
 HONEST NOTES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -85,7 +73,6 @@ FMP_KEY      = os.environ.get("FMP_API_KEY", "").strip()
 FMP_BASE     = "https://financialmodelingprep.com/stable"
 FINNHUB_KEY  = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-# ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 86400))  # re-analyze once/day
 RATIOS_TTL_H  = 24          # fundamentals cache (hours)
 GROWTH_TTL_H  = 24 * 7     # growth cache (weekly)
@@ -95,11 +82,8 @@ FETCH_WORKERS = 2     # fewer parallel workers
 PRICE_BARS    = 250   # fewer bars per call
 
 # Parallel fetch workers (PATCH 06).
-# 6 workers cut cycle time from ~20 min to ~3 min on the free FMP plan.
-# Raise via FETCH_WORKERS env var on a paid plan.
 _FETCH_WORKERS = int(os.environ.get("FETCH_WORKERS", 6))
 
-# ── Universe (~56 liquid names; name+sector embedded so we spend 0 calls on it)
 U = [
     ("AAPL","Apple","Technology"),("MSFT","Microsoft","Technology"),
     ("NVDA","NVIDIA","Technology"),("GOOGL","Alphabet","Communication Services"),
@@ -138,16 +122,8 @@ UNIVERSE = [{"sym": s, "name": n, "sector": sec, "etf": sec == "ETF / Fund"} for
 ETF_SET  = {u["sym"] for u in UNIVERSE if u["etf"]}
 BENCH    = "SPY"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VERDICT & CONVICTION
-# ══════════════════════════════════════════════════════════════════════════════
 
 def verdict(score):
-    """
-    Raw-score verdict — used during per-stock assembly, before the full
-    universe is known. After run_cycle() completes, normalize_verdicts()
-    overwrites these with percentile-based verdicts.
-    """
     if score >= 0.45:   return "STRONG BUY"
     elif score >= 0.18: return "BUY"
     elif score <= -0.45: return "STRONG SELL"
@@ -169,11 +145,6 @@ def verdict_from_pct(pct, macro_score=0.0):
         SELL        <= 32nd pct   (~bottom 32%)
         STRONG SELL <= 12th pct   (~bottom 12%)
 
-    Regime shift (max ±8 pct-points):
-        Risk-on  (macro > 0.3) → top band HARDER to reach (strong stocks
-                                  are common; only outliers deserve STRONG BUY)
-        Risk-off (macro < -0.3)→ top band EASIER to reach (holding up in a
-                                  down market deserves credit)
     """
     shift = max(-8.0, min(8.0, float(macro_score) * 10.0))
 
@@ -190,18 +161,6 @@ def verdict_from_pct(pct, macro_score=0.0):
 
 
 def normalize_verdicts(signals, macro_score=0.0):
-    """
-    Re-assign verdicts across the full universe using percentile rank (PATCH 01).
-
-    Called once at the end of run_cycle(), after all stocks are scored.
-    Modifies `signals` in place — overwrites 'verdict' and adds 'pct_rank'
-    on each horizon dict.
-
-    Parameters
-    ----------
-    signals     : dict  sym -> signal dict (must have 'st' and 'lt' with 'score')
-    macro_score : float from market_regime()['score'], range [-1, +1]
-    """
     if not signals:
         return
 
@@ -248,8 +207,6 @@ def conviction(score, factors):
 def conviction_tier(c):
     return "High" if c >= 72 else ("Moderate" if c >= 60 else "Low")
 
-
-# ── In-memory state ───────────────────────────────────────────────────────────
 state = {
     "signals": {}, "sectors": [], "last_updated": None,
     "status": "starting", "progress": {"done": 0, "total": len(UNIVERSE)},
@@ -257,10 +214,6 @@ state = {
 }
 lock   = threading.Lock()
 _cache = {}   # key -> (value, fetched_at)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PURE-PYTHON INDICATORS  (lists are oldest → newest)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def sma(v, p):
     return sum(v[-p:]) / p if len(v) >= p else None
@@ -288,25 +241,6 @@ def rsi(v, period=14):
     return round(100 - 100 / (1 + rs), 2)
 
 def macd(v, confirm_bars=3):
-    """
-    MACD with robust crossover detection (PATCH 05).
-
-    Replaces the brittle 3-bar lookback (line[-3] <= sig[-3]) with
-    held-sign detection:
-
-    1. Find the index of the most recent sign-change in (line - signal).
-    2. Count how many bars the new side has held (bars_since_cross).
-    3. Count how many bars the previous side held before the cross (prev_run).
-    4. A valid crossover requires:
-         • bars_since_cross in [1, confirm_bars+1]  — recent enough to act on
-         • prev_run >= confirm_bars                 — previous side was stable
-                                                      (suppresses choppy whipsaw)
-
-    This correctly handles:
-      - Clean trend reversals  → fires once, expires after confirm_bars bars
-      - Choppy oscillation     → prev_run is tiny, so valid=False (no signal)
-      - Slow crosses           → the +1 buffer handles gradual crossovers
-    """
     if len(v) < 35: return 0.0, 0.0, False, False
     e12  = ema_series(v, 12); e26 = ema_series(v, 26)
     line = [a - b for a, b in zip(e12, e26)]
@@ -390,9 +324,6 @@ def _pct(x):
     try:   return round(float(x) * 100, 1)
     except (TypeError, ValueError): return None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIGNALS
-# ══════════════════════════════════════════════════════════════════════════════
 
 ST_W = {"trend":0.25, "momentum":0.30, "meanrev":0.10, "volume":0.10, "relstr":0.15, "quant":0.10}
 LT_W = {"growth":0.20, "profit":0.15, "health":0.15, "valuation":0.20, "sentiment":0.10, "trend":0.20}
@@ -420,7 +351,6 @@ def _assemble(score, factors, reasons, metrics, price):
 def short_term_signal(closes, highs, lows, vols, spy):
     price = closes[-1]; factors = []; reasons = []
 
-    # ── Trend (MA20 / MA50 / MA200) ──────────────────────────────────────────
     ma20, ma50, ma200 = sma(closes, 20), sma(closes, 50), sma(closes, 200)
     t = 0.0
     if ma50 and ma200:
@@ -431,7 +361,6 @@ def short_term_signal(closes, highs, lows, vols, spy):
         else:            t -= 0.4; reasons.append("Price below 20-day average")
     factors.append(_f("Trend", clamp(t), ST_W["trend"]))
 
-    # ── Momentum (RSI + MACD) ─────────────────────────────────────────────────
     r = rsi(closes); mval, msig, up, dn = macd(closes); m = 0.0
     if r < 30:   m += 0.6; reasons.append(f"RSI {r} — oversold, bounce potential")
     elif r < 45: m += 0.2
@@ -443,19 +372,12 @@ def short_term_signal(closes, highs, lows, vols, spy):
     else:             m -= 0.3
     factors.append(_f("Momentum", clamp(m), ST_W["momentum"]))
 
-    # ── Mean reversion (Bollinger %b) ─────────────────────────────────────────
     pb = bollinger_pctb(closes); mr = 0.0
     if pb < 0.05:   mr += 0.8; reasons.append("Below lower Bollinger band — stretched down")
     elif pb < 0.2:  mr += 0.4
     elif pb > 0.95: mr -= 0.8; reasons.append("Above upper Bollinger band — stretched up")
     elif pb > 0.8:  mr -= 0.4
     factors.append(_f("Mean reversion", clamp(mr), ST_W["meanrev"]))
-
-    # ── Volume ────────────────────────────────────────────────────────────────
-    # Direction is determined by actual price movement (close vs prior close),
-    # NOT by the momentum sub-score. This prevents circular confirmation where
-    # volume "agrees" with an RSI/MACD blend rather than real price direction.
-    # We also check 3-day net direction to avoid whipsawing on a single noisy bar.
     v = 0.0
     if len(vols) >= 20 and len(closes) >= 4:
         vr = (sum(vols[-5:]) / 5) / ((sum(vols[-20:]) / 20) or 1e-9)
@@ -477,13 +399,11 @@ def short_term_signal(closes, highs, lows, vols, spy):
             reasons.append("Thin volume — move lacks conviction")
     factors.append(_f("Volume", clamp(v), ST_W["volume"]))
 
-    # ── Relative strength vs S&P (15-day) ────────────────────────────────────
     rs15 = rel_strength(closes, spy, 15)
     if rs15 > 5:   reasons.append(f"Outperforming S&P by {rs15:.1f}% (3wk)")
     elif rs15 < -5: reasons.append(f"Lagging S&P by {abs(rs15):.1f}% (3wk)")
     factors.append(_f("Relative strength", clamp(rs15 / 10.0), ST_W["relstr"]))
 
-    # ── Quant / volatility risk ───────────────────────────────────────────────
     av = ann_vol(closes); q = 0.0
     if av is not None:
         if av > 60:  q = -0.4; reasons.append(f"Very high volatility ({av}%/yr) — elevated risk")
@@ -561,19 +481,6 @@ def long_term_signal(closes, spy, fund, is_etf, sector_pe_map=None):
         elif 0 < cr < 1:   h -= 0.3; reasons.append("Weak liquidity (current ratio < 1)")
         factors.append(_f("Financial health", clamp(h), LT_W["health"]))
 
-        # ── Valuation (PATCH 03: sector-relative P/E) ────────────────────────
-        # Instead of fixed universal bands, we score pe relative to the live
-        # sector median fetched from FMP (or the hardcoded fallback).
-        #
-        # Bands are set at:
-        #   cheap  = sector_median × 0.75  (25% discount → clearly cheap)
-        #   fair   = sector_median × 1.00  (at sector norm)
-        #   rich   = sector_median × 1.40  (40% premium → clearly expensive)
-        #   very_rich = sector_median × 1.75
-        #
-        # This means a Tech stock at P/E 26 next to a sector median of 35
-        # scores as "attractive", while a Utility at P/E 26 next to a sector
-        # median of 18 scores as "expensive" — which is correct.
         val = 0.0
         spe_map   = sector_pe_map or _SECTOR_PE_FALLBACK
         sector_pe = spe_map.get(sector) or spe_map.get("Consumer Defensive", 22.0)
@@ -603,7 +510,6 @@ def long_term_signal(closes, spy, fund, is_etf, sector_pe_map=None):
             elif peg > 3: val -= 0.4; reasons.append(f"PEG {peg:.2f} — growth fully priced in")
         factors.append(_f("Valuation", clamp(val), LT_W["valuation"]))
 
-        # Sentiment (analyst price target)
         s = 0.0
         if tgt and price:
             up = (tgt - price) / price
@@ -653,9 +559,7 @@ def long_term_signal(closes, spy, fund, is_etf, sector_pe_map=None):
         "MA200":             _r(ma200),
     })
 
-    # PATCH 04: low data coverage — warn and discount score toward zero.
-    # A stock with only 3/9 fundamental fields available (new IPO, spin-off,
-    # foreign filer) should not get a confident LT signal based on zeros.
+    # low data coverage — warn and discount score toward zero.
     if low_coverage:
         reasons.insert(0, f"⚠ Low data coverage ({coverage}%) — "
                           f"missing: {', '.join(missing[:4])}. LT score discounted.")
@@ -670,10 +574,6 @@ def long_term_signal(closes, spy, fund, is_etf, sector_pe_map=None):
     result = _assemble(score, factors, reasons, metrics, price)
     result["low_coverage"] = low_coverage   # flag for dashboard warning badge
     return result
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FMP DATA LAYER
-# ══════════════════════════════════════════════════════════════════════════════
 
 def fmp(path, params=None):
     params = dict(params or {}); params["apikey"] = FMP_KEY
@@ -702,7 +602,6 @@ def cached(key, ttl_h, fetch):
 
 
 def get_prices(sym):
-    # New stable endpoint: returns list of {symbol, date, open, high, low, close, volume}
     data = fmp(f"historical-price-eod/full", {"symbol": sym, "limit": PRICE_BARS})
     if not isinstance(data, list) or not data:
         return None
@@ -713,8 +612,6 @@ def get_prices(sym):
     lows   = [h.get("low",   h["close"])   for h in hist if h.get("close") is not None]
     vols   = [h.get("volume", 0) or 0      for h in hist if h.get("close") is not None]
     return (closes, highs, lows, vols) if len(closes) >= 60 else None
-
-# ── SEC EDGAR (official filings — primary, authenticated source, no key) ──────
 EDGAR_UA      = os.environ.get("EDGAR_UA", "stock-analyzer personal-research contact@example.com")
 EDGAR_HEADERS = {"User-Agent": EDGAR_UA, "Accept-Encoding": "gzip, deflate"}
 
@@ -745,7 +642,6 @@ def load_cik_map():
 
 
 def _annual_series(data, concepts):
-    """Return {year -> value} for full-year (≈365-day) facts, by period-end year."""
     facts = data.get("facts", {}).get("us-gaap", {})
     for c in concepts:
         usd = (facts.get(c, {}).get("units", {}) or {}).get("USD")
@@ -800,7 +696,6 @@ def get_fundamentals(sym, sector):
     g = (growth[0] if isinstance(growth, list) and growth else {}) or {}
     t = (target[0] if isinstance(target, list) and target else {}) or {}
 
-    # PATCH 04: track which fields are genuinely present vs silently missing.
     missing_fields = []
 
     def pick(d, field_label, *keys):
@@ -811,9 +706,6 @@ def get_fundamentals(sym, sector):
         missing_fields.append(field_label)
         return 0.0
 
-    # stable/ratios-ttm drops the "TTM" suffix vs the old api/v3 endpoint.
-    # stable/financial-growth uses camelCase growth fields.
-    # stable/price-target-consensus uses targetConsensus / targetMedian.
     fund = {
         "rev":    pick(g, "revenue growth",  "revenueGrowth",         "growthRevenue"),
         "earn":   pick(g, "earnings growth", "epsgrowth",             "netIncomeGrowth",    "growthNetIncome"),
@@ -838,7 +730,6 @@ def get_fundamentals(sym, sector):
     fund["data_coverage"]  = coverage_pct
     fund["missing_fields"] = core_missing
 
-    # ── Cross-check / ground against official SEC EDGAR filings ──────────────
     edgar      = get_edgar(sym)
     confidence = "FMP data"; edgar_rev = None; edgar_fy = None; flag = None
 
@@ -859,7 +750,6 @@ def get_fundamentals(sym, sector):
     fund["edgar_fy"]   = edgar_fy
     return fund
 
-# ── Finnhub: aggregated Wall Street analyst consensus (free tier) ─────────────
 def finnhub_get(path, params=None):
     params = dict(params or {}); params["token"] = FINNHUB_KEY
     try:
@@ -889,14 +779,6 @@ def get_consensus(sym):
         "verdict": verdict(score), "score": round(score, 3),
     }
 
-# ── Sector P/E map (fetched once per cycle, cached 24h) ──────────────────────
-#
-# FMP's /sector-price-earning-ratio endpoint returns the current TTM P/E
-# median for each GICS sector. We use this to score each stock's P/E
-# relative to its own sector norm rather than hard-coded universal bands.
-#
-# Fallback table (used when the API call fails or a sector is missing).
-# Values are long-run medians — conservative enough to be safe as defaults.
 _SECTOR_PE_FALLBACK = {
     "Technology":              35.0,
     "Communication Services":  22.0,
@@ -912,7 +794,6 @@ _SECTOR_PE_FALLBACK = {
     "ETF / Fund":              22.0,
 }
 
-# FMP sector name → our sector label
 _FMP_SECTOR_NAME_MAP = {
     "Technology":             "Technology",
     "Communication Services": "Communication Services",
@@ -966,7 +847,6 @@ def get_sector_pe_map():
     return merged
 
 
-# ── Market regime (computed macro signal from the broad market) ───────────────
 def market_regime(spy):
     ma200 = sma(spy, 200); price = spy[-1]
     mom   = momentum(spy, min(126, len(spy)-1)); vol = ann_vol(spy)
@@ -980,7 +860,6 @@ def market_regime(spy):
     regime = "Risk-on" if score > 0.3 else ("Risk-off" if score < -0.3 else "Neutral")
     return {"regime": regime, "score": round(score, 2), "note": "; ".join(notes) or "mixed"}
 
-# ── Combined view: model (ST+LT) + analyst consensus + macro ─────────────────
 def combined_view(st, lt, cons, macro_score):
     factors  = [{"contrib": lt["score"]*0.35}, {"contrib": st["score"]*0.25}]
     opinions = [lt["score"], st["score"]]
@@ -1001,10 +880,6 @@ def combined_view(st, lt, cons, macro_score):
         "has_analyst": bool(cons),
         "pct_rank":    None,   # filled by normalize_verdicts()
     }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ANALYSIS CYCLE
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_cycle():
     if not FMP_KEY:
@@ -1063,9 +938,6 @@ def run_cycle():
             print(f"  {sym}: {e}")
             return sym, None
 
-    # PATCH 06: parallel fetch with per-symbol timeout.
-    # Each worker calls analyze_one(); if a single FMP call hangs, the timeout
-    # (90 s) kills just that future — the rest of the cycle continues normally.
     done_count = 0
     with _cf.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
         futures = {pool.submit(analyze_one, u): u for u in UNIVERSE}
@@ -1090,7 +962,6 @@ def run_cycle():
                         state["progress"] = {"done": done_count, "total": len(UNIVERSE)}
                         state["status"]   = "analyzing"
 
-    # ── PATCH 01: re-assign verdicts using universe percentile ranks ──────────
     normalize_verdicts(new, macro.get("score", 0.0) if macro else 0.0)
 
     with lock:
@@ -1121,7 +992,6 @@ def start_worker():
 
 start_worker()
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory(BASE_DIR, "dashboard.html")
