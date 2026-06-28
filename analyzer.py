@@ -49,7 +49,7 @@ FMP_KEY      = os.environ.get("FMP_API_KEY", "").strip()
 FMP_BASE     = "https://financialmodelingprep.com/api/v3"
 FINNHUB_KEY  = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-
+# ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 86400))  # re-analyze once/day
 RATIOS_TTL_H  = 24          # fundamentals cache (hours)
 GROWTH_TTL_H  = 24 * 7     # growth cache (weekly)
@@ -57,6 +57,7 @@ TARGET_TTL_H  = 24 * 7     # analyst target cache (weekly)
 PRICE_BARS    = 400         # daily bars to pull (enough for MA200 + 1y momentum)
 CALL_SLEEP    = 0.25        # gentle pause between API calls
 
+# ── Universe (~56 liquid names; name+sector embedded so we spend 0 calls on it)
 U = [
     ("AAPL","Apple","Technology"),("MSFT","Microsoft","Technology"),
     ("NVDA","NVIDIA","Technology"),("GOOGL","Alphabet","Communication Services"),
@@ -94,6 +95,10 @@ U = [
 UNIVERSE = [{"sym": s, "name": n, "sector": sec, "etf": sec == "ETF / Fund"} for s, n, sec in U]
 ETF_SET  = {u["sym"] for u in UNIVERSE if u["etf"]}
 BENCH    = "SPY"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VERDICT & CONVICTION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def verdict(score):
     """
@@ -202,6 +207,7 @@ def conviction_tier(c):
     return "High" if c >= 72 else ("Moderate" if c >= 60 else "Low")
 
 
+# ── In-memory state ───────────────────────────────────────────────────────────
 state = {
     "signals": {}, "sectors": [], "last_updated": None,
     "status": "starting", "progress": {"done": 0, "total": len(UNIVERSE)},
@@ -210,7 +216,9 @@ state = {
 lock   = threading.Lock()
 _cache = {}   # key -> (value, fetched_at)
 
-
+# ══════════════════════════════════════════════════════════════════════════════
+# PURE-PYTHON INDICATORS  (lists are oldest → newest)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def sma(v, p):
     return sum(v[-p:]) / p if len(v) >= p else None
@@ -295,6 +303,9 @@ def _pct(x):
     try:   return round(float(x) * 100, 1)
     except (TypeError, ValueError): return None
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNALS
+# ══════════════════════════════════════════════════════════════════════════════
 
 ST_W = {"trend":0.25, "momentum":0.30, "meanrev":0.10, "volume":0.10, "relstr":0.15, "quant":0.10}
 LT_W = {"growth":0.20, "profit":0.15, "health":0.15, "valuation":0.20, "sentiment":0.10, "trend":0.20}
@@ -322,7 +333,7 @@ def _assemble(score, factors, reasons, metrics, price):
 def short_term_signal(closes, highs, lows, vols, spy):
     price = closes[-1]; factors = []; reasons = []
 
-
+    # ── Trend (MA20 / MA50 / MA200) ──────────────────────────────────────────
     ma20, ma50, ma200 = sma(closes, 20), sma(closes, 50), sma(closes, 200)
     t = 0.0
     if ma50 and ma200:
@@ -333,7 +344,7 @@ def short_term_signal(closes, highs, lows, vols, spy):
         else:            t -= 0.4; reasons.append("Price below 20-day average")
     factors.append(_f("Trend", clamp(t), ST_W["trend"]))
 
-
+    # ── Momentum (RSI + MACD) ─────────────────────────────────────────────────
     r = rsi(closes); mval, msig, up, dn = macd(closes); m = 0.0
     if r < 30:   m += 0.6; reasons.append(f"RSI {r} — oversold, bounce potential")
     elif r < 45: m += 0.2
@@ -345,6 +356,7 @@ def short_term_signal(closes, highs, lows, vols, spy):
     else:             m -= 0.3
     factors.append(_f("Momentum", clamp(m), ST_W["momentum"]))
 
+    # ── Mean reversion (Bollinger %b) ─────────────────────────────────────────
     pb = bollinger_pctb(closes); mr = 0.0
     if pb < 0.05:   mr += 0.8; reasons.append("Below lower Bollinger band — stretched down")
     elif pb < 0.2:  mr += 0.4
@@ -352,22 +364,39 @@ def short_term_signal(closes, highs, lows, vols, spy):
     elif pb > 0.8:  mr -= 0.4
     factors.append(_f("Mean reversion", clamp(mr), ST_W["meanrev"]))
 
-    
+    # ── Volume ────────────────────────────────────────────────────────────────
+    # Direction is determined by actual price movement (close vs prior close),
+    # NOT by the momentum sub-score. This prevents circular confirmation where
+    # volume "agrees" with an RSI/MACD blend rather than real price direction.
+    # We also check 3-day net direction to avoid whipsawing on a single noisy bar.
     v = 0.0
-    if len(vols) >= 20:
+    if len(vols) >= 20 and len(closes) >= 4:
         vr = (sum(vols[-5:]) / 5) / ((sum(vols[-20:]) / 20) or 1e-9)
-        d  = 1 if m >= 0 else -1
-        if vr > 1.8:  v = d * 0.8; reasons.append(f"Volume surging ({vr:.1f}x avg) — confirms move")
-        elif vr > 1.3: v = d * 0.4
-        elif vr < 0.6: v = -d * 0.3; reasons.append("Thin volume — weak conviction")
+        # 3-day net move: positive = price trending up, negative = down
+        net3 = closes[-1] - closes[-4]
+        d    = 1 if net3 > 0 else (-1 if net3 < 0 else 0)
+        if d == 0:
+            # Flat over 3 days — volume confirms nothing
+            v = 0.0
+        elif vr > 1.8:
+            v = d * 0.8
+            direction_word = "up" if d > 0 else "down"
+            reasons.append(f"Volume surging ({vr:.1f}x avg) on {direction_word}move — confirms direction")
+        elif vr > 1.3:
+            v = d * 0.4
+        elif vr < 0.6:
+            # Thin volume — weakens whatever direction price is moving
+            v = -abs(d) * 0.3
+            reasons.append("Thin volume — move lacks conviction")
     factors.append(_f("Volume", clamp(v), ST_W["volume"]))
 
+    # ── Relative strength vs S&P (15-day) ────────────────────────────────────
     rs15 = rel_strength(closes, spy, 15)
     if rs15 > 5:   reasons.append(f"Outperforming S&P by {rs15:.1f}% (3wk)")
     elif rs15 < -5: reasons.append(f"Lagging S&P by {abs(rs15):.1f}% (3wk)")
     factors.append(_f("Relative strength", clamp(rs15 / 10.0), ST_W["relstr"]))
 
-   
+    # ── Quant / volatility risk ───────────────────────────────────────────────
     av = ann_vol(closes); q = 0.0
     if av is not None:
         if av > 60:  q = -0.4; reasons.append(f"Very high volatility ({av}%/yr) — elevated risk")
@@ -506,6 +535,9 @@ def long_term_signal(closes, spy, fund, is_etf):
     })
     return _assemble(score, factors, reasons, metrics, price)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FMP DATA LAYER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fmp(path, params=None):
     params = dict(params or {}); params["apikey"] = FMP_KEY
