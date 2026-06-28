@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 """
 US Stock Analyzer — dual-horizon edition
 
@@ -83,7 +85,7 @@ CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 FMP_KEY      = os.environ.get("FMP_API_KEY", "").strip()
-FMP_BASE     = "https://financialmodelingprep.com/api/v3"
+FMP_BASE     = "https://financialmodelingprep.com/stable"
 FINNHUB_KEY  = os.environ.get("FINNHUB_API_KEY", "").strip()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -702,13 +704,16 @@ def cached(key, ttl_h, fetch):
 
 
 def get_prices(sym):
-    data = fmp(f"historical-price-full/{sym}", {"timeseries": PRICE_BARS})
-    if not data or "historical" not in data: return None
-    hist   = list(reversed(data["historical"]))   # oldest → newest
-    closes = [h["close"]                for h in hist if h.get("close") is not None]
-    highs  = [h.get("high",  h["close"]) for h in hist if h.get("close") is not None]
-    lows   = [h.get("low",   h["close"]) for h in hist if h.get("close") is not None]
-    vols   = [h.get("volume", 0) or 0    for h in hist if h.get("close") is not None]
+    # New stable endpoint: returns list of {symbol, date, open, high, low, close, volume}
+    data = fmp(f"historical-price-eod/full", {"symbol": sym, "limit": PRICE_BARS})
+    if not isinstance(data, list) or not data:
+        return None
+    # Newest first → reverse to oldest first
+    hist   = list(reversed(data))
+    closes = [h["close"]                   for h in hist if h.get("close") is not None]
+    highs  = [h.get("high",  h["close"])   for h in hist if h.get("close") is not None]
+    lows   = [h.get("low",   h["close"])   for h in hist if h.get("close") is not None]
+    vols   = [h.get("volume", 0) or 0      for h in hist if h.get("close") is not None]
     return (closes, highs, lows, vols) if len(closes) >= 60 else None
 
 # ── SEC EDGAR (official filings — primary, authenticated source, no key) ──────
@@ -787,9 +792,9 @@ def get_edgar(sym):
 
 def get_fundamentals(sym, sector):
     ratios = cached(f"ratios:{sym}",  RATIOS_TTL_H,
-                    lambda: fmp(f"ratios-ttm/{sym}"))
+                    lambda: fmp(f"ratios-ttm", {"symbol": sym}))
     growth = cached(f"growth:{sym}",  GROWTH_TTL_H,
-                    lambda: fmp(f"financial-growth/{sym}", {"period": "annual", "limit": 1}))
+                    lambda: fmp(f"financial-growth", {"symbol": sym, "period": "annual", "limit": 1}))
     target = cached(f"target:{sym}",  TARGET_TTL_H,
                     lambda: fmp(f"price-target-consensus", {"symbol": sym}))
 
@@ -798,10 +803,6 @@ def get_fundamentals(sym, sector):
     t = (target[0] if isinstance(target, list) and target else {}) or {}
 
     # PATCH 04: track which fields are genuinely present vs silently missing.
-    # pick() returns (value, found) so we know whether a 0.0 is real data or
-    # just an absent field. missing_fields drives a data_coverage warning shown
-    # in the UI — a stock with 6/9 fields missing should say so, not pretend
-    # its LT score is based on full fundamentals.
     missing_fields = []
 
     def pick(d, field_label, *keys):
@@ -812,31 +813,32 @@ def get_fundamentals(sym, sector):
         missing_fields.append(field_label)
         return 0.0
 
+    # stable/ratios-ttm drops the "TTM" suffix vs the old api/v3 endpoint.
+    # stable/financial-growth uses camelCase growth fields.
+    # stable/price-target-consensus uses targetConsensus / targetMedian.
     fund = {
-        "rev":    pick(g, "revenue growth",    "growthRevenue",    "revenueGrowth"),
-        "earn":   pick(g, "earnings growth",   "growthNetIncome",  "epsgrowth",        "growthEPS"),
-        "pm":     pick(r, "net margin",        "netProfitMarginTTM",   "netProfitMargin"),
-        "roe":    pick(r, "ROE",               "returnOnEquityTTM",    "returnOnEquity"),
-        "roa":    pick(r, "ROA",               "returnOnAssetsTTM",    "returnOnAssets"),
-        "de":     pick(r, "debt/equity",       "debtEquityRatioTTM",   "debtToEquityTTM",   "debtEquityRatio"),
-        "cr":     pick(r, "current ratio",     "currentRatioTTM",      "currentRatio"),
-        "fcfy":   pick(r, "FCF yield",         "freeCashFlowYieldTTM", "freeCashFlowYield"),
-        "pe":     pick(r, "P/E",               "peRatioTTM",           "priceEarningsRatioTTM", "peRatio"),
-        "peg":    pick(r, "PEG",               "pegRatioTTM",          "priceEarningsToGrowthRatioTTM", "pegRatio"),
-        "ps":     pick(r, "P/S",               "priceToSalesRatioTTM", "priceSalesRatioTTM"),
-        "target": pick(t, "analyst target",    "targetConsensus",      "targetMean",        "priceTargetAverage"),
+        "rev":    pick(g, "revenue growth",  "revenueGrowth",         "growthRevenue"),
+        "earn":   pick(g, "earnings growth", "epsgrowth",             "netIncomeGrowth",    "growthNetIncome"),
+        "pm":     pick(r, "net margin",      "netProfitMargin",       "netProfitMarginTTM"),
+        "roe":    pick(r, "ROE",             "returnOnEquity",        "returnOnEquityTTM"),
+        "roa":    pick(r, "ROA",             "returnOnAssets",        "returnOnAssetsTTM"),
+        "de":     pick(r, "debt/equity",     "debtEquityRatio",       "debtEquityRatioTTM",  "debtToEquityTTM"),
+        "cr":     pick(r, "current ratio",   "currentRatio",          "currentRatioTTM"),
+        "fcfy":   pick(r, "FCF yield",       "freeCashFlowYield",     "freeCashFlowYieldTTM"),
+        "pe":     pick(r, "P/E",             "peRatio",               "peRatioTTM",          "priceEarningsRatioTTM"),
+        "peg":    pick(r, "PEG",             "pegRatio",              "pegRatioTTM",         "priceEarningsToGrowthRatioTTM"),
+        "ps":     pick(r, "P/S",             "priceToSalesRatio",     "priceToSalesRatioTTM","priceSalesRatioTTM"),
+        "target": pick(t, "analyst target",  "targetConsensus",       "targetMedian",        "targetMean"),
         "growth_sector": sector in ("Technology", "Communication Services", "Consumer Cyclical"),
         "sector":        sector,
     }
 
-    # Coverage score: fraction of the 9 core fields that were actually present.
-    # PEG and P/S are optional extras, so we track 9 core fields.
     CORE_FIELDS = {"revenue growth", "earnings growth", "net margin", "ROE",
                    "debt/equity", "current ratio", "FCF yield", "P/E", "analyst target"}
     core_missing = [f for f in missing_fields if f in CORE_FIELDS]
     coverage_pct = round((len(CORE_FIELDS) - len(core_missing)) / len(CORE_FIELDS) * 100)
-    fund["data_coverage"]   = coverage_pct          # 0–100 %
-    fund["missing_fields"]  = core_missing          # list shown in UI warning
+    fund["data_coverage"]  = coverage_pct
+    fund["missing_fields"] = core_missing
 
     # ── Cross-check / ground against official SEC EDGAR filings ──────────────
     edgar      = get_edgar(sym)
@@ -891,7 +893,7 @@ def get_consensus(sym):
 
 # ── Sector P/E map (fetched once per cycle, cached 24h) ──────────────────────
 #
-# FMP's /sector_price_earning_ratio endpoint returns the current TTM P/E
+# FMP's /sector-price-earning-ratio endpoint returns the current TTM P/E
 # median for each GICS sector. We use this to score each stock's P/E
 # relative to its own sector norm rather than hard-coded universal bands.
 #
@@ -938,7 +940,8 @@ def get_sector_pe_map():
     Cached 24 h to avoid burning daily API quota.
     """
     def fetch():
-        data = fmp("sector_price_earning_ratio", {"date": "", "exchange": "NYSE"})
+        # stable/sector-price-earning-ratio returns [] on free plan → falls back gracefully
+        data = fmp("sector-price-earning-ratio", {})
         if not isinstance(data, list) or not data:
             return None
         out = {}
