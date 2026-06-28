@@ -13,14 +13,11 @@ REQUIRED ENVIRONMENT VARIABLES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FMP_API_KEY   (required)  — Financial Modeling Prep key.
                             Free tier = 250 req/day; universe is ~56 stocks,
-                            one full cycle ≈ 200 calls. Upgrade for more stocks
-                            or faster refresh. https://financialmodelingprep.com
 
 OPTIONAL ENVIRONMENT VARIABLES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINNHUB_API_KEY  — Finnhub key for Wall St. analyst buy/hold/sell consensus.
                    Without it, the Consensus column in the dashboard is hidden.
-                   Free tier is sufficient. https://finnhub.io
 
 EDGAR_UA         — User-Agent string sent to SEC EDGAR (required by SEC ToS).
                    Default: "stock-analyzer personal-research contact@example.com"
@@ -93,8 +90,9 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 86400))  # re-analyze once/d
 RATIOS_TTL_H  = 24          # fundamentals cache (hours)
 GROWTH_TTL_H  = 24 * 7     # growth cache (weekly)
 TARGET_TTL_H  = 24 * 7     # analyst target cache (weekly)
-PRICE_BARS    = 400         # daily bars to pull (enough for MA200 + 1y momentum)
-CALL_SLEEP    = 0.25        # gentle pause between API calls per worker
+CALL_SLEEP    = 0.5   # slower, respects rate limits
+FETCH_WORKERS = 2     # fewer parallel workers
+PRICE_BARS    = 250   # fewer bars per call
 
 # Parallel fetch workers (PATCH 06).
 # 6 workers cut cycle time from ~20 min to ~3 min on the free FMP plan.
