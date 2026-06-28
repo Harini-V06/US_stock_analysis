@@ -1,223 +1,153 @@
-# 📈 Dual-Horizon US Stock Analyzer
+# US Stock Analyzer
 
-A self-hosted dashboard that scores ~130 liquid US stocks (and ETFs) on **two
-separate time horizons** — short-term (1–3 weeks, technical/quant) and
-long-term (5 years, fundamentals/valuation) — and serves the results through
-a live, auto-refreshing web dashboard.
+A dual-horizon stock analysis tool that scores 57 US stocks across short-term technical signals (1–3 weeks) and long-term fundamental signals (5 years). Served as a live auto-refreshing dashboard via Flask.
 
-It is an **analysis tool, not a trading bot.** It does not place trades, hold
-positions, or touch any money, real or paper. It pulls market data, scores
-it against a transparent rule set, and shows you the *reasoning* behind every
-call.
+**Analysis only — not financial advice. No trades are executed.**
 
 <img width="956" height="453" alt="0" src="https://github.com/user-attachments/assets/82886323-b8d3-4b0b-81ff-ec284b213c79" />
 
+---
+
+## What it does
+
+Each stock gets two independent scores:
+
+**Short-term (1–3 weeks)** — technicals and quant signals
+- Trend: MA20 / MA50 / MA200 alignment
+- Momentum: RSI (Wilder smoothing) + MACD crossover
+- Mean reversion: Bollinger %b
+- Volume: surge/thin vs 20-day average, confirmed by actual price direction
+- Relative strength vs S&P 500 (15-day)
+- Volatility risk: annualised vol penalty
+
+**Long-term (5 years)** — fundamentals and valuation
+- Growth: revenue + earnings growth (SEC EDGAR cross-checked)
+- Profitability: net margin + ROE + ROA
+- Financial health: FCF yield + debt/equity + current ratio
+- Valuation: P/E scored vs live sector median (not hardcoded bands) + PEG
+- Sentiment: analyst price target upside
+- Long-term trend: MA50/MA200 + 1-year return vs S&P
+
+A **combined view** blends both horizons (LT 35%, ST 25%) with analyst consensus (30%) and macro regime (10%).
 
 ---
 
-## Why two horizons?
+## Signals and scoring
 
-A stock can look great for a 3-week swing trade and bad for a 5-year hold
-(or vice versa). Most screeners collapse this into one score. This tool
-keeps them separate and scores each stock twice, side by side, using a
-different factor model for each:
+Verdicts (STRONG BUY / BUY / HOLD / SELL / STRONG SELL) are assigned by **universe-wide percentile rank**, not fixed score thresholds. BUY means top ~30% of the current universe this cycle. The bands shift ±8 percentile points based on the macro regime — harder to get STRONG BUY when the whole market is trending up, easier when it's risk-off.
 
-| | Short-term (1–3 wk) | Long-term (5 yr) |
-|---|---|---|
-| **Driven by** | Technicals + quant | Fundamentals + valuation |
-| **Inputs** | RSI, MACD, Bollinger %b, moving averages, momentum, relative strength vs S&P, volatility | Revenue/earnings growth, margins, ROE/ROA, debt, free cash flow, P/E, PEG, analyst targets |
-| **ETFs** | Scored normally (price-based) | Scored on trend only — fundamentals don't apply to a fund |
+**Conviction** (50–80%) measures how strongly the factors agree, not the probability the call is right. It is deliberately capped at 80%.
+
+**Data coverage warning** — stocks with fewer than 60% of core fundamental fields available (new IPOs, spin-offs) have their long-term score discounted and show a ⚠ warning.
 
 ---
 
-## How scoring works
+## Data sources
 
-Every factor produces a sub-score in `[-1, +1]`, gets multiplied by a fixed
-weight, and the weighted sum becomes the stock's net score for that horizon.
+| Source | Used for | Key required |
+|--------|----------|-------------|
+| Financial Modeling Prep (stable API) | Price history, ratios, growth, analyst targets | Yes — `FMP_API_KEY` |
+| SEC EDGAR (XBRL) | Cross-check revenue figures against official filings | No |
+| Finnhub | Wall St. analyst buy/hold/sell consensus | Optional — `FINNHUB_API_KEY` |
 
-**Short-term weights**
+> **Free FMP plan = 250 requests/day.** A full 57-stock cycle uses ~180 calls. Results are cached for 24 hours so the quota is only consumed once per day on restart.
 
-| Factor | Weight |
-|---|---|
-| Trend (MA20/50/200) | 25% |
-| Momentum (RSI + MACD) | 30% |
-| Mean reversion (Bollinger %b) | 10% |
-| Volume confirmation | 10% |
-| Relative strength vs S&P (15d) | 15% |
-| Quant / volatility risk | 10% |
+---
 
-**Long-term weights**
+## Setup
 
-| Factor | Weight |
-|---|---|
-| Growth (revenue + earnings) | 20% |
-| Profitability (margins, ROE, ROA) | 15% |
-| Financial health (FCF yield, debt, liquidity) | 15% |
-| Valuation (P/E, PEG vs sector norms) | 20% |
-| Sentiment (analyst targets/rating) | 10% |
-| Long-run trend (MA50/MA200, 1y momentum & rel. strength) | 20% |
+### 1. Clone and install dependencies
 
-**Net score → verdict**
+```bash
+git clone https://github.com/Harini-V06/US_stock_analysis
+cd US_stock_analysis
+pip install flask flask-cors requests python-dotenv
+```
+
+### 2. Create a `.env` file
 
 ```
-score ≥ +0.45   → STRONG BUY
-score ≥ +0.18   → BUY
-score ≤ −0.45   → STRONG SELL
-score ≤ −0.18   → SELL
-else            → HOLD
+FMP_API_KEY=your_fmp_key_here
+FINNHUB_API_KEY=your_finnhub_key_here
+POLL_INTERVAL=86400
 ```
 
-**Conviction is *not* a probability.** It measures how strongly the factors
-agree with each other, not how likely the call is to be correct. It's
-deliberately floored at 50% and capped at 80%, and tiered as Low / Moderate
-/ High in the UI. This distinction is shown directly in the dashboard
-disclaimer so it's never mistaken for a confidence score.
+Get your FMP key at [financialmodelingprep.com](https://financialmodelingprep.com) (free tier is sufficient).  
+Get your Finnhub key at [finnhub.io](https://finnhub.io) (free tier, optional — hides consensus column if absent).
+
+### 3. Run
+
+```bash
+# bash / Mac / Linux
+python analyzer.py
+
+# Windows PowerShell
+python analyzer.py
+```
+
+Open **http://localhost:5001** in your browser. The first cycle takes ~5 minutes on the free FMP plan. After that, results are cached and load instantly.
 
 ---
 
-## Features
+## Configuration
 
-- **130-stock universe out of the box** across tech, financials, healthcare,
-  industrials, energy, autos/EV, consumer, and broad-market ETFs — or flip
-  one flag to pull the full S&P 500 instead.
-- **Dual scoring per stock**: independent verdict, conviction %, top factors,
-  and full metric breakdown for both horizons.
-- **Transparent reasoning** — every card has a "Why & full metrics" expander
-  showing the plain-English reasons behind the score (e.g. *"RSI 28 —
-  oversold, bounce potential"*) plus the raw numbers used.
-- **Live dashboard**: search by ticker/name, filter by sector or
-  buy/sell/horizon, sort by conviction or biggest day move, manual refresh
-  button, auto-polls every 20 seconds.
-- **Background refresh cycle** — re-scores prices every 30 minutes and caches
-  fundamentals for 12 hours, so the UI stays current without hammering the
-  data provider.
-- **No external backend required** — single Flask process serves both the
-  API and the static dashboard.
+All config is in `analyzer.py` or `.env`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FMP_API_KEY` | — | Required. FMP API key |
+| `FINNHUB_API_KEY` | — | Optional. Adds analyst consensus column |
+| `EDGAR_UA` | `stock-analyzer personal-research contact@example.com` | User-agent for SEC EDGAR (required by SEC ToS) |
+| `POLL_INTERVAL` | `86400` | Seconds between full re-analysis cycles (1 day) |
+| `FETCH_WORKERS` | `2` | Parallel fetch threads. Keep at 2 on free FMP plan |
+| `PRICE_BARS` | `250` | Daily bars fetched per stock (~1 year) |
+| `PORT` | `5001` | Flask port |
+
+> Do not raise `FETCH_WORKERS` above 3 or lower `CALL_SLEEP` below 0.4 on the free FMP plan — you will hit 429 rate limits and burn your daily quota.
+
+---
+
+## Dashboard features
+
+- **Macro regime banner** — Risk-on / Neutral / Risk-off based on S&P 500 position, momentum, and volatility
+- **Filter tabs** — All / Short-term buys / Short-term sells / Long-term buys / Long-term sells
+- **Sector filter** — dropdown to isolate a sector
+- **Sort** — by conviction, day move, or A–Z
+- **Search** — by ticker or company name
+- **Expandable cards** — click any card for full factor breakdown, metrics, and reasons
+- **Percentile rank** — shown next to each verdict (e.g. "78th") so you can see exactly where a stock ranks
+- **Auto-refresh** — polls `/api/status` every 20 seconds
+- **Data coverage warning** — ⚠ badge on stocks with sparse fundamental data
 
 ---
 
 ## Tech stack
 
-| Layer | Tools |
-|---|---|
-| Backend | Python, Flask, Flask-CORS |
-| Data | [`yfinance`](https://pypi.org/project/yfinance/) (5y daily OHLCV + fundamentals), NumPy, pandas |
-| Frontend | Vanilla HTML/CSS/JS — no framework, no build step |
-| Indicators | RSI(14), MACD(12,26,9), Bollinger %b, SMA(20/50/200), ATR%, annualized volatility, max drawdown, 52-week range position |
+| Component | Technology |
+|-----------|-----------|
+| Backend | Python 3, Flask, flask-cors |
+| Data | Financial Modeling Prep (stable API), SEC EDGAR XBRL |
+| Indicators | Pure Python — no numpy or pandas |
+| Frontend | Vanilla JS, HTML/CSS (single file) |
+| Concurrency | `concurrent.futures.ThreadPoolExecutor` |
 
 ---
 
-## Quick start
+## Patches applied
 
-```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
-
-pip install -r requirements.txt
-python analyzer.py
-```
-
-Then open **http://localhost:5001** in your browser.
-
-> ⏱️ **First run takes a few minutes** — it's pulling 5 years of daily data
-> for ~130 tickers in one bulk request. Results stream into the dashboard as
-> each stock finishes scoring, and it auto-refreshes every 20 seconds, so
-> you don't need to reload manually.
-
-### Customizing the universe
-
-Open `analyzer.py` and edit the `UNIVERSE` list near the top — just add or
-remove tickers. To analyze the full S&P 500 instead of the built-in list,
-set:
-
-```python
-USE_SP500 = True
-```
-
-(Slower on the first run since it pulls the full list from Wikipedia and
-downloads data for ~500 tickers instead of ~130.)
-
----
-
-## API reference
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Serves the dashboard |
-| `GET` | `/api/status` | Current scored universe, sectors, progress, and last-updated timestamp as JSON |
-| `POST` | `/api/refresh` | Kicks off a manual re-analysis cycle in the background |
-
-`/api/status` response shape (per symbol):
-
-```json
-{
-  "AAPL": {
-    "name": "Apple Inc.",
-    "sector": "Technology",
-    "price": 213.45,
-    "day_change": 1.12,
-    "st": { "verdict": "BUY", "score": 0.31, "conviction": 64, "tier": "Moderate",
-            "reasons": ["..."], "factors": [...], "metrics": {...} },
-    "lt": { "verdict": "HOLD", "score": 0.05, "conviction": 51, "tier": "Low",
-            "reasons": ["..."], "factors": [...], "metrics": {...} }
-  }
-}
-```
-
----
-
-## Project structure
-
-```
-.
-├── analyzer.py     # Flask backend: data fetch, indicators, scoring, API routes
-├── dashboard.html  # Self-contained frontend — dark-themed, no build step
-├── requirements.txt
-├── assets/
-│   └── dashboard-screenshot.png
-└── README.md
-```
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A[Background thread\nevery 30 min] -->|bulk download| B[yfinance\n5y daily OHLCV + SPY]
-    B --> C[Indicator calc\nRSI / MACD / Bollinger / MAs]
-    C --> D[Short-term scorer]
-    B --> E[yfinance .info\nfundamentals, cached 12h]
-    E --> F[Long-term scorer]
-    D --> G[(In-memory state)]
-    F --> G
-    G --> H[GET /api/status]
-    H --> I[dashboard.html\npolls every 20s]
-```
+| # | Description |
+|---|-------------|
+| 01 | Percentile-based verdicts — relative to universe, not fixed thresholds |
+| 02 | Volume direction fix — uses actual price movement, not momentum sub-score |
+| 03 | Sector-relative P/E — scores vs live sector median |
+| 04 | Missing data tracking — discounts LT scores when fundamental coverage is sparse |
+| 05 | Robust MACD crossover — held-sign detection with stability check |
+| 06 | Parallel fetch — ThreadPoolExecutor with per-symbol timeout |
+| 07 | FMP stable API migration — all endpoints updated from deprecated api/v3 |
 
 ---
 
 ## Disclaimer
 
-This project is for educational and personal-analysis purposes only. It is
-**not financial advice**, does not execute trades, and the "conviction"
-score is explicitly not a probability of being correct. Technical and
-fundamental factors describe current conditions — they do not reliably
-predict future prices. Always do your own research before making investment
-decisions.
+This tool is for **research and educational purposes only**. It does not constitute financial advice. Scores and verdicts are relative rankings within a fixed universe — they are not predictions of future price movements. Always do your own research before making any investment decisions.
 
----
-
-## Roadmap / ideas for next iteration
-
-- [ ] Persist historical signals to compare verdict accuracy over time
-- [ ] Backtest the scoring rules against historical price action
-- [ ] Add a watchlist / portfolio view with personal holdings highlighted
-- [ ] Dockerfile for one-command deployment
-- [ ] Swap polling for WebSockets for true real-time updates
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
